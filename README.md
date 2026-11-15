@@ -197,6 +197,27 @@ powershell -ExecutionPolicy Bypass -File tools\build.ps1
 Genera `EBOOT.PBP` en la raíz y lo copia junto a `host.txt` y `RUN.txt` en
 `dist\PSPTorqueOBD\`, listo para copiar a la Memory Stick.
 
+#### Alternativa sin Docker: WSL
+
+Si Docker no está disponible (o se rompe), el toolchain también funciona
+dentro de una distro WSL de Linux:
+
+```bash
+# 1. Extraer la imagen pspdev/pspdev del registro de Docker Hub
+#    (216 MB; no necesita el motor de Docker) a un directorio, por
+#    ejemplo D:/pspdev-root
+# 2. Copiar el toolchain a la ruta que espera:
+cp -a /mnt/d/pspdev-root/usr/local/pspdev /usr/local/
+# 3. El loader de musl busca las librerias en su fichero de ruta:
+echo /mnt/d/pspdev-root/usr/lib > /etc/ld-musl-x86_64.path
+echo /mnt/d/pspdev-root/lib     >> /etc/ld-musl-x86_64.path
+# 4. Compilar:
+sh /mnt/d/psp_torqueOBD/tools/build_wsl.sh
+```
+
+`tools/build_wsl.sh` hace la limpieza, compila, copia a `dist/` y saca el
+SHA-256.
+
 ### Pruebas del núcleo
 
 El núcleo portable no depende de la PSP y se prueba en PC con `gcc`:

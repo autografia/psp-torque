@@ -196,6 +196,27 @@ This produces `EBOOT.PBP` in the project root and copies it next to
 `host.txt` and `RUN.txt` into `dist\PSPTorqueOBD\`, ready to copy to the
 Memory Stick.
 
+#### Fallback without Docker: WSL
+
+If Docker is unavailable (or breaks), the toolchain also works inside a
+Linux WSL distribution:
+
+```bash
+# 1. Extract the pspdev/pspdev image from the Docker Hub registry
+#    (216 MB; no container engine needed) into a directory, say
+#    D:/pspdev-root
+# 2. Copy the toolchain to the path it expects:
+cp -a /mnt/d/pspdev-root/usr/local/pspdev /usr/local/
+# 3. The musl loader looks for libraries in its path file:
+echo /mnt/d/pspdev-root/usr/lib > /etc/ld-musl-x86_64.path
+echo /mnt/d/pspdev-root/lib     >> /etc/ld-musl-x86_64.path
+# 4. Build:
+sh /mnt/d/psp_torqueOBD/tools/build_wsl.sh
+```
+
+`tools/build_wsl.sh` cleans, compiles, copies into `dist/` and prints the
+SHA-256.
+
 ### Core tests
 
 The portable core has no PSP dependency and is tested on the PC with `gcc`:

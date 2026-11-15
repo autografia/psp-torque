@@ -37,23 +37,24 @@ extern const int PROFILE_MOTOR_POLL_COUNT;
 
 /* Periodos de los PID que solo se sondean si la mascara los declara
  * soportados. */
-#define PROFILE_PID_MAF_PERIOD_MS   700
-#define PROFILE_PID_PEDAL_PERIOD_MS 700
-#define PROFILE_PID_VOLT_PERIOD_MS  5000
-#define PROFILE_PID_OIL_PERIOD_MS   5000
-#define PROFILE_PID_FUEL_PERIOD_MS  10000
+#define PROFILE_PID_MAF_PERIOD_MS   1000
+#define PROFILE_PID_PEDAL_PERIOD_MS 1000
+#define PROFILE_PID_VOLT_PERIOD_MS  10000
+#define PROFILE_PID_OIL_PERIOD_MS   10000
+#define PROFILE_PID_FUEL_PERIOD_MS  20000
 
-/* FASE E2: presupuesto de peticiones del enlace.
+/* FASE E2 + A: presupuesto de peticiones del enlace.
  *
  * Medido sobre un clon ELM327 v1.5 por WiFi: una peticion completa
  * (envio + respuesta del coche + hueco entre peticiones) ronda los
- * 55 ms, es decir ~18 peticiones/s como maximo. Si la suma de los
- * periodos del planificador pide mas que eso, todos los PID se degradan
- * a la vez y el tacometro va con retraso (FASE E, fase2.39).
+ * 55-83 ms segun cuanto hueco quede entre comandos. El suelo medido
+ * es de ~12 peticiones/s y, con el hueco eliminado (FASE C), ~18.
  *
- * El presupuesto es 17 req/s: deja margen para los reintentos por
- * STOPPED y los timeouts, que en un viaje real no son raros. */
-#define PROFILE_LINK_BUDGET_REQ_S 17.0f
+ * El presupuesto es 13 req/s: la cifra CONSERVADORA (la que se sostiene
+ * aunque el ELM327 no tolere comandos seguidos) mas un pequeño margen.
+ * La demanda en el caso peor queda en 12,05 req/s y en un coche normal
+ * alrededor de 11. */
+#define PROFILE_LINK_BUDGET_REQ_S 13.0f
 
 extern const obd_poll_def PROFILE_ENGINE_POLL[];
 extern const int PROFILE_ENGINE_POLL_COUNT;

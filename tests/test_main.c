@@ -19,8 +19,8 @@ static void test_profile(void)
     CHECK(PROFILE_ENGINE_POLL_COUNT >= 10);
     CHECK(PROFILE_QV_POLL[0].pid == 0x0C);
     CHECK(PROFILE_QV_POLL[1].pid == 0x0B);
-    CHECK(PROFILE_QV_POLL[0].period_ms == 350);
-    CHECK(PROFILE_QV_POLL[1].period_ms == 350);
+    CHECK(PROFILE_QV_POLL[0].period_ms == 250);
+    CHECK(PROFILE_QV_POLL[1].period_ms == 500);
     CHECK(PROFILE_BARO_FALLBACK_KPA > 50.0f);
     CHECK(PROFILE_BARO_FALLBACK_KPA < 110.0f);
 }
@@ -69,16 +69,16 @@ static void test_link_budget(void)
 
     /* El RPM y el MAP son los que van en el tacometro: su periodo debe
      * ser corto comparados con el resto. */
-    CHECK(PROFILE_QV_POLL[0].period_ms <= 400);
-    CHECK(PROFILE_QV_POLL[1].period_ms <= 400);
+    CHECK(PROFILE_QV_POLL[0].period_ms <= 300);
+    CHECK(PROFILE_QV_POLL[1].period_ms <= 600);
 
-    /* Ningun PID por debajo de 250 ms: por debajo de eso la demanda se
+    /* Ningun PID por debajo de 200 ms: por debajo de eso la demanda se
      * dispara y el enlace no da mas. */
     for (int i = 0; i < PROFILE_QV_POLL_COUNT; i++) {
-        CHECK(PROFILE_QV_POLL[i].period_ms >= 250);
+        CHECK(PROFILE_QV_POLL[i].period_ms >= 200);
     }
     for (int i = 0; i < PROFILE_EXTRA_POLL_COUNT; i++) {
-        CHECK(PROFILE_EXTRA_POLL[i].period_ms >= 250);
+        CHECK(PROFILE_EXTRA_POLL[i].period_ms >= 200);
     }
     for (int i = 0; i < PROFILE_MOTOR_POLL_COUNT; i++) {
         CHECK(PROFILE_MOTOR_POLL[i].period_ms >= 1000);

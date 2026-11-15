@@ -60,7 +60,7 @@ PSP_HEAP_SIZE_KB(4096);
 #define DEFAULT_HOST "192.168.0.10"
 #define DEFAULT_PORT 35000
 #define MAX_TARGETS 4
-#define BUILD_TAG "fase2.40 2026-11-15 FASE E1+E2+E3 latencia: sondeo desacoplado del render, cadencia recalibrada y suavizado con tau fijo"
+#define BUILD_TAG "fase2.41 2026-11-15 FASE C+A envio inmediato y cadencia rebalanceada: RPM a 4 Hz"
 #define CMD_TIMEOUT_MS 500
 /* Si el adaptador ha demostrado que envia el prompt '>', hay que esperarlo
  * antes de mandar el siguiente comando. El ELM327 hace tareas internas
@@ -2094,6 +2094,52 @@ static void elm_send_and_read(int sock, const char *cmd, int wait_ms,
     }
 
     *reply = rx.reply;
+}
+
+/* ------------------------------------------------------------------ */
+/* Envio de la siguiente peticion OBD (FASE C).                       */
+/* ------------------------------------------------------------------ */
+
+/* Envia el PID que toque segun el planificador. Devuelve 1 si se ha
+ * enviado, 0 si no tocaba nada y -1 si el envio ha fallado.
+ *
+ * Se separa del bucle principal para poder llamarla en dos momentos:
+ * al principio de la iteracion (cuando no hay nada en vuelo) y justo
+ * despues de procesar una respuesta (FASE C: el comando siguiente sale
+ * de inmediato, sin esperar al frame ni al hueco de espera). */
+static int obd_send_next(int sock, elm_rx *rx, int *rx_idx, uint8_t *rx_pid,
+                         uint32_t *rx_t0)
+{
+    if (sock < 0 || rx->active) {
+        return 0;
+    }
+
+    int idx = obd_sched_next(&g_sched, now_ms());
+    if (idx < 0) {
+        return 0;
+    }
+
+    obd_poll_item *item = &g_sched.items[idx];
+    uint8_t pid = item->pid;
+    char cmd[8];
+
+    elm_build_request(cmd, sizeof(cmd), 0x01, pid);
+    obd_sched_begin(&g_sched, idx, now_ms());
+
+    *rx_idx = idx;
+    *rx_pid = pid;
+    *rx_t0 = now_ms();
+
+    if (elm_rx_start(rx, sock, cmd, CMD_TIMEOUT_MS) < 0) {
+        /* El socket esta muerto. Se libera el PID como si fuera un
+         * timeout (no como "no soportado") para que el planificador no
+         * se quede colgado con la peticion en vuelo. */
+        obd_sched_end(&g_sched, idx, now_ms(), 1);
+        memset(rx, 0, sizeof(*rx));
+        return -1;
+    }
+
+    return 1;
 }
 
 
@@ -7233,6 +7279,11 @@ static void run_dashboard(Target *targets, int target_count)
     /* FASE E1: la peticion se acaba de completar; la siguiente espera
      * es fina (2 ms) para que el comando siguiente salga ya. */
     int rx_just_done = 0;
+    /* FASE C: hueco real entre el fin de una respuesta y el envio de la
+     * siguiente. Se registra en el log para ver si el ELM327 tolera que
+     * el comando salga de inmediato. */
+    uint32_t gap_acc = 0;
+    uint32_t gap_n = 0;
     memset(&rx, 0, sizeof(rx));
 
     for (;;) {
@@ -7364,26 +7415,11 @@ static void run_dashboard(Target *targets, int target_count)
         int rx_ready = 0;
         if (sock >= 0 && !g_demo) {
             if (!rx.active) {
-                int idx = obd_sched_next(&g_sched, now);
-                if (idx >= 0) {
-                    obd_poll_item *item = &g_sched.items[idx];
-                    uint8_t pid = item->pid;
-                    char cmd[8];
-
-                    elm_build_request(cmd, sizeof(cmd), 0x01, pid);
-                    obd_sched_begin(&g_sched, idx, now);
-
-                    rx_idx = idx;
-                    rx_pid = pid;
-                    rx_t0 = now_ms();
-
-                    if (elm_rx_start(&rx, sock, cmd, CMD_TIMEOUT_MS) < 0) {
-                        rx_ready = 1;
-                    }
+                int sent = obd_send_next(sock, &rx, &rx_idx, &rx_pid, &rx_t0);
+                if (sent < 0) {
+                    rx_ready = 1;
                 }
-            }
-
-            if (rx.active && elm_rx_step(&rx) != ELM_RX_PENDING) {
+            } else if (elm_rx_step(&rx) != ELM_RX_PENDING) {
                 rx_ready = 1;
             }
         }
@@ -7461,6 +7497,28 @@ static void run_dashboard(Target *targets, int target_count)
             }
 
             memset(&rx, 0, sizeof(rx));
+
+            /* FASE C: la peticion siguiente sale YA. Antes habia un
+             * hueco de ~24 ms entre el fin de una respuesta y el envio
+             * de la siguiente (espera del frame + espera fina + preambulo
+             * del bucle). Ese hueco se comia un tercio del ciclo de 83 ms
+             * y era lo que limitaba el enlace a 12 peticiones/s.
+             *
+             * Se mide el hueco resultante con la metrica "gap" del log:
+             * si el ELM327 no tolera recibir el comando tan pronto
+             * apareceran STOPPED y habra que buscar el minimo seguro. */
+            if (sock >= 0 && !g_demo) {
+                uint32_t prev_done = (uint32_t)t1;
+                int sent = obd_send_next(sock, &rx, &rx_idx, &rx_pid, &rx_t0);
+                if (sent > 0) {
+                    gap_acc += (uint32_t)(rx_t0 - prev_done);
+                    gap_n++;
+                }
+                /* Si el envio falla, el socket esta muerto. No se cuenta
+                 * aqui: la siguiente iteracion lo reintenta, falla otra
+                 * vez y el contador de timeouts de la ruta normal lleva
+                 * la cuenta (y dispara la reconexion al llegar a 8). */
+            }
 
             /* FASE E1: la peticion acaba de completarse. Se marca para
              * que la espera siguiente sea de 2 ms y no un VBlank entero:
@@ -7563,10 +7621,11 @@ static void run_dashboard(Target *targets, int target_count)
             if (sample_value(0x0D, now, &f)) fmt_0(spd, sizeof(spd), f);
 
             log_file_printf("t=%u rpm=%s map=%s boost=%s ect=%s iat=%s "
-                            "spd=%s rtt=%d ok=%d nd=%d to=%d fps=%d "
+                            "spd=%s rtt=%d gap=%d ok=%d nd=%d to=%d fps=%d "
                             "cpu=%u wait=%u int=%u vb=%d v=%d%s\n",
                             (unsigned)(session_ms / 1000), rpm, map,
                             boost, ect, iat, spd, last_rtt,
+                            (int)(gap_n ? (gap_acc / gap_n) : 0),
                             data_count, no_data_count, timeouts,
                             g_fps,
                             (unsigned)(g_perf_cpu_us / 1000u),
@@ -7576,6 +7635,8 @@ static void run_dashboard(Target *targets, int target_count)
                             g_demo ? " (SIM)" :
                             (sock >= 0 ? "" : " (offline)"));
             last_status = now;
+            gap_acc = 0;
+            gap_n = 0;
         }
     }
 

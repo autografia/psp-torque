@@ -155,6 +155,46 @@ Criterios de aceptacion:
 - [ ] El RPM se refresca a >= 2,5 Hz en el coche (era 1,31 Hz).
 - [ ] El retardo percibido al acelerar es < 0,5 s (era ~1,5 s).
 
+## Fase 2.7 — Suavidad del indicador (FASE C + A)
+
+Objetivo: que la aguja no de saltos. Con la FASE E el retardo habia
+desaparecido, pero el RPM se refrescaba solo 2,14 veces por segundo: la
+aguja se dibujaba a 30 fps sobre un dato que cambiaba 2,14 veces/s, asi que
+daba escalones de 1400 rpm.
+
+Diagnostico sobre `phase1_071` (fase2.40, 27 min, sin STOPPED ni timeouts):
+
+| Magnitud | Valor |
+|---|---|
+| Ciclo por peticion | 83 ms (50 del ELM327 + ~24 de hueco + ~9 de lo demas) |
+| Capacidad del enlace | 12,05 peticiones/s |
+| Demanda del planificador | 16,03 req/s (saturado un 33%) |
+| Cadencia del RPM | 467 ms (2,14 Hz) |
+| Suavizado EMA | alpha = 0,955 a 467 ms: ya era transparente |
+
+Tareas:
+
+1. [x] **C — Envio inmediato.** El comando siguiente sale en cuanto se
+   procesa la respuesta, sin esperar al frame ni al hueco de espera. Se
+   anade la metrica `gap` al log para medir el hueco real. Si el ELM327
+   no tolera comandos seguidos apareceran STOPPED y habra que buscar el
+   minimo seguro.
+2. [x] **A — Reparto del presupuesto.** Los periodos se reparten en vez de
+   repartir el ancho de banda a partes iguales: RPM a 250 ms (4 Hz), MAP a
+   500 ms, y lo que cambia despacio (trims, O2, avance, distancia,
+   voltaje, baro, combustible) a 10-20 s.
+   La demanda baja de 16,03 a 12,05 req/s y cabe en el presupuesto
+   (`PROFILE_LINK_BUDGET_REQ_S` = 13, la cifra conservadora).
+
+Criterios de aceptacion:
+
+- [x] La demanda del planificador cabe en la capacidad del enlace
+      (test `test_link_budget`: 12,05 req/s < 13,0).
+- [ ] El RPM se refresca a >= 3,5 Hz en el coche (era 2,14 Hz).
+- [ ] No aparecen STOPPED al enviar comandos seguidos (si aparecen, hay
+      que fijar un hueco minimo).
+- [ ] El retardo percibido al acelerar es < 0,3 s.
+
 ## Fase 3 — Parámetros específicos Alfa Romeo (investigación)
 
 Tareas:
