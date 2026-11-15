@@ -1,0 +1,144 @@
+#include "obd/scheduler.h"
+
+#include <string.h>
+#include "obd/pid.h"
+
+void obd_sched_init(obd_scheduler *sched)
+{
+    memset(sched, 0, sizeof(*sched));
+    sched->in_flight = -1;
+}
+
+int obd_sched_add(obd_scheduler *sched, uint8_t pid,
+                  uint16_t period_ms, uint8_t priority)
+{
+    if (sched->count >= OBD_SCHED_MAX) {
+        return -1;
+    }
+
+    obd_poll_item *item = &sched->items[sched->count];
+    memset(item, 0, sizeof(*item));
+    item->pid = pid;
+    item->period_ms = (period_ms > 0) ? period_ms : 100;
+    item->priority = priority;
+    item->next_due_ms = 0;
+    item->supported = 0;
+
+    return sched->count++;
+}
+
+int obd_sched_next(obd_scheduler *sched, uint32_t now_ms)
+{
+    if (sched->in_flight >= 0) {
+        return -1;
+    }
+
+    int best = -1;
+    for (int i = 0; i < sched->count; i++) {
+        obd_poll_item *item = &sched->items[i];
+        if (item->supported == 2) {
+            continue;
+        }
+        if ((int32_t)(now_ms - item->next_due_ms) < 0) {
+            continue;
+        }
+        if (best < 0) {
+            best = i;
+            continue;
+        }
+
+        obd_poll_item *cur = &sched->items[best];
+        /* EDF: el mas antiguo primero, para no dejar morir a los de
+         * baja prioridad cuando el RTT supera sus periodos. */
+        if ((int32_t)(item->next_due_ms - cur->next_due_ms) < 0) {
+            best = i;
+        } else if (item->next_due_ms == cur->next_due_ms) {
+            if (item->priority < cur->priority) {
+                best = i;
+            } else if (item->priority == cur->priority && i < best) {
+                best = i;
+            }
+        }
+    }
+
+    return best;
+}
+
+void obd_sched_begin(obd_scheduler *sched, int idx, uint32_t now_ms)
+{
+    (void)now_ms;
+    if (idx >= 0 && idx < sched->count) {
+        sched->in_flight = idx;
+    }
+}
+
+void obd_sched_end(obd_scheduler *sched, int idx, uint32_t now_ms,
+                   int got_data)
+{
+    if (idx < 0 || idx >= sched->count) {
+        return;
+    }
+    if (sched->in_flight == idx) {
+        sched->in_flight = -1;
+    }
+
+    obd_poll_item *item = &sched->items[idx];
+    item->next_due_ms = now_ms + item->period_ms;
+
+    if (got_data) {
+        item->no_data_count = 0;
+        if (item->supported == 0) {
+            item->supported = 1;
+        }
+    } else {
+        if (item->no_data_count < 255) {
+            item->no_data_count++;
+        }
+        if (item->no_data_count >= 3) {
+            item->supported = 2;
+        }
+    }
+}
+
+void obd_sched_set_supported(obd_scheduler *sched, int idx, int supported)
+{
+    if (idx < 0 || idx >= sched->count) {
+        return;
+    }
+    sched->items[idx].supported = supported ? 1 : 2;
+    sched->items[idx].no_data_count = 0;
+}
+
+int obd_sched_apply_mask(obd_scheduler *sched, uint32_t mask,
+                         uint8_t first_pid)
+{
+    int changed = 0;
+
+    for (int i = 0; i < sched->count; i++) {
+        obd_poll_item *item = &sched->items[i];
+        int offset = (int)item->pid - (int)first_pid;
+        if (offset < 0 || offset > 31) {
+            continue;
+        }
+
+        int supported = obd_mask_supports(mask, (uint8_t)(offset + 1));
+        uint8_t next = (uint8_t)(supported ? 1 : 2);
+        if (item->supported != next) {
+            changed++;
+            item->supported = next;
+            item->no_data_count = 0;
+        }
+    }
+
+    return changed;
+}
+
+void obd_sched_reset_due(obd_scheduler *sched, uint32_t now_ms)
+{
+    for (int i = 0; i < sched->count; i++) {
+        if (sched->items[i].supported != 2) {
+            sched->items[i].next_due_ms = now_ms;
+        }
+    }
+    sched->in_flight = -1;
+}

@@ -1,0 +1,13 @@
+# PSP Torque OBD - destino ELM327
+#
+# Copia este archivo en:
+#   ms0:/PSP/GAME/PSPTorqueOBD/host.txt
+#
+# Formato: IP PUERTO
+# Si el archivo no existe, se usa 192.168.0.10:35000.
+#
+# ELM327 WiFi habitual:
+192.168.0.10 35000
+#
+# Simulador en el PC (sustituir por la IP local del PC):
+# 192.168.1.50 35000

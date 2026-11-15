@@ -1,0 +1,308 @@
+PSP Torque - dashboard OBD-II para PSP
+========================================
+
+QUE HACE
+  Abre directamente el dashboard grafico 480x272 (fondo negro, colores
+  Alfa Romeo / Quadrifoglio Verde) tras la animacion del trebol. La
+  conexion WiFi y la busqueda del ELM327 ocurren detras, con un aviso
+  grafico sobre el propio dashboard: nunca se ve una pantalla de texto.
+
+  Conecta al ELM327 por WiFi, lee las mascaras 0100/0120 y sondea los
+  PID del perfil. Si no hay adaptador, el dashboard sigue funcionando
+  con todos los valores en N/D.
+
+  MODO UNIVERSAL
+  La app usa el protocolo OBD-II estandar (SAE J1979) y deja que el
+  ELM327 detecte solo el protocolo con ATSP0. Los PIDs se activan o
+  desactivan segun las mascaras reales de la ECU, asi que sirve para
+  otros coches OBD-II:
+    - Si hay MAP (0x0B) se calcula BOOST = MAP - BARO.
+    - Si no hay MAP pero si MAF (0x10), la pantalla muestra MAF en g/s
+      y BOOST queda en N/D (sin MAP no se puede calcular).
+    - El pedal usa 0x49, 0x4A o 0x5A; si no existe, se usa la mariposa.
+    - Aceite, combustible y tension solo se muestran si existen.
+    - RPM MAX y BOOST MAX se ajustan en SELECT para adaptar las
+      escalas a cualquier coche. La zona roja es automatica
+      (RPM MAX menos 500).
+  Los PIDs de fabricante (modo 22, p. ej. aceite real, presion de turbo
+  objetivo, DPF) no son universales y no se inventan.
+
+  Pantallas:
+    GENERAL    tacometro, velocidad, boost y tiles ECT/IAT/MAP
+    MOTOR      rejilla de tiles (MAP o MAF, BOOST, ECT, IAT,
+               ACELERADOR, MARIPOSA/LOAD, tension, aceite y combustible).
+               Los PID no disponibles muestran N/D o NO SOP y no dejan
+               hueco: las cajas validas se compactan.
+    DIAG       diagnostico avanzado de solo lectura: STFT, LTFT, avance,
+               tensiones O2, combustible, voltaje y distancia con MIL.
+               Solo se muestran los datos que la ECU soporta.
+    TELEMETRIA grafica de RPM/BOOST/ECT y maximos/minimos de sesion.
+    MODULOS    descubrimiento de centralitas: OBD-II y UDS. Pulsa X
+               para escanear (ver mas abajo).
+    SNIFFER    captura todo el trafico CAN del bus. Util para
+               interceptar AlfaOBD/MES y obtener DIDs de fabricante.
+    INFO       descripcion breve de cada parametro (RPM, ECT, IAT,
+               MAP, STFT...). ARRIBA/ABAJO desplaza la lista.
+
+  ACELERADOR es el pedal real (PID 0x49/0x4A/0x5A).
+  MARIPOSA es la posicion de la mariposa (PID 0x11): al ralenti puede
+  quedarse en ~15 % aunque no toques el pedal, y por eso no debe
+  confundirse con el acelerador.
+  ACEITE (0x5C) solo se muestra si la ECU lo soporta; en el MiTo QV
+  la mascara 0140 no lo anuncia, asi que aparece NO SOP.
+  COMBUSTIBLE es el nivel de deposito (0x2F) si esta soportado.
+
+  BOOST = MAP - BARO. El baro se toma, por orden, de:
+    1) PID 0x33
+    2) captura KEY-ON (motor parado al inicio)
+    3) fallback 101.3 kPa marcado EST
+
+CONTROLES
+  L / R o LEFT / RIGHT : cambiar de pantalla
+  TRIANGLE             : reintentar la conexion con el perfil WiFi guardado
+  SQUARE               : abrir la configuracion WiFi de la PSP y reconectar
+  SELECT o START       : abrir/cerrar el menu de ajustes
+  X o START            : saltar la animacion de arranque
+  L + R (1,5 s)        : activar/desactivar el MODO DEMO
+  (para salir de la app: START > SALIR > X)
+
+  El modo demo simula un coche en movimiento (aceleracion, cambios,
+  crucero y frenada) y marca la cabecera con DEMO. No usa el coche ni
+  el ELM327; sirve para probar la interfaz, los temas y las escalas.
+
+  En la pantalla MODULOS:
+  X                    : iniciar el escaneo de centralitas
+  ARRIBA / ABAJO       : elegir un modulo de la lista
+  CIRCLE               : cancelar un escaneo en curso
+  L / R                : cambiar de pantalla
+
+  En la pantalla SNIFFER:
+  X                    : iniciar/parar la captura
+  ARRIBA / ABAJO       : desplazar la vista
+  L / R                : cambiar de pantalla
+  (todo el trafico CAN se guarda en el log de la sesion)
+
+  No hay limite de tiempo: el dashboard funciona hasta que elijas
+  SALIR dentro del menu (START > SALIR > X).
+  Si se pierde el enlace con el ELM327, el dashboard pasa a modo N/D y
+  sigue abierto: la reconexion se reintenta sola cada 2 s (hasta 3
+  intentos) sin bloquear la interfaz. Si no se recupera, pulsa TRIANGLE
+  para reintentar a mano. El motivo queda escrito en el log de esa
+  sesion, y el resumen final indica cuantos cortes hubo.
+
+AJUSTES DE TEMA
+  Pulsa START (o SELECT) en el dashboard. La ventana permite cambiar:
+    TEMA        NORMAL (color), FORZA, NFS, GRAN TURISMO, INITIAL D,
+                CYBERPUNK, RETRO 80, NOTHING, BACK FUTURE, TODO GAS
+    CONTRASTE   BAJO, NORMAL o ALTO
+    ANIMACION   SI o NO (animacion del trebol al arrancar)
+    MUESTREO    COMPLETO o RAPIDO (rapido: menos PID, mas fluidez)
+    EDITAR VISTA abre el editor del panel: cada hueco se puede poner
+                en RELOJ, BARRA, TEXTO u OCULTO y cambiar de dato.
+    PICO MAX    SI o NO (retiene el maximo de RPM/boost/velocidad)
+    SHIFT RPM   valor en RPM para el shift light
+    RPM MAX     fondo de escala del tacometro (4000-9000);
+                la zona roja se calcula sola (RPM MAX - 500)
+    UNIDADES    METRICO (km/h, C, bar, g/s) o
+                IMPERIAL (mph, F, psi, lb/min)
+    TURBO AUTO  SI: el fondo de escala del turbo se aprende solo
+    BOOST MAX   fondo manual (al tocarlo se desactiva TURBO AUTO)
+    SALIR       cierra la aplicacion (pulsa X sobre esta opcion)
+  ARRIBA/ABAJO elige la opcion; IZQ/DER cambia el valor.
+  CIRCLE borra el maximo de turbo aprendido.
+  X guarda y cierra el menu. Se guarda en:
+    ms0:/PSP/GAME/PSPTorqueOBD/settings.txt
+  Los ajustes se aplican al instante y se conservan al reiniciar.
+
+EDITOR DE LA VISTA
+  En AJUSTES elige EDITAR VISTA y pulsa X. Se entra en el editor del
+  panel principal, con seis huecos:
+    1  tacometro grande      4  fila inferior izquierda
+    2  zona superior derecha 5  fila inferior central
+    3  zona central derecha  6  fila inferior derecha
+  Para cada hueco:
+    ARRIBA/ABAJO  elige el hueco
+    IZQ/DER       RELOJ -> BARRA -> TEXTO -> OCULTO
+    TRIANGLE      siguiente dato disponible (RPM, VELOCIDAD, BOOST,
+                  ECT, IAT, MAP, MAF, ACELERADOR, CARGA, MARIPOSA,
+                  VOLT, ACEITE, COMBUSTIBLE, STFT, LTFT, AVANCE, O2-1,
+                  O2-2, MIL y BARO; solo los que soporta la ECU)
+    SQUARE        dato anterior
+    X o START     guarda y vuelve a AJUSTES
+  La eleccion se guarda en settings.txt (slotN_item / slotN_style).
+
+TELEMETRIA
+  La pestana TELEMETRIA dibuja hasta cinco series a la vez. Pulsa X
+  dentro de TELEMETRIA para elegir que se pinta en cada serie:
+    RPM, BOOST, ECT, VELOCIDAD, IAT, MAP, MAF, ACELERADOR, CARGA,
+    MARIPOSA, VOLT, ACEITE, COMBUSTIBLE, STFT, LTFT, AVANCE, O2-1,
+    O2-2, MIL, BARO u OCULTO
+  La lista se adapta a cada coche/ECU: solo aparecen los datos que las
+  mascaras OBD declaran como soportados (mas OCULTO). ARRIBA/ABAJO
+  elige la serie; IZQ/DER cambia el dato; X o START guarda. Las cinco
+  casillas inferiores muestran MAX/MIN de cada serie.
+
+INFORMACION DE PARAMETROS
+  La pestana INFO explica que es cada dato que se puede mostrar:
+  RPM, VELOCIDAD, BOOST, ECT, IAT, MAP, MAF, ACELERADOR, CARGA,
+  MARIPOSA, VOLT, ACEITE, COMBUSTIBLE, STFT, LTFT, AVANCE, O2-1,
+  O2-2, MIL y BARO, con el PID estandar del que sale cada uno.
+  Tambien aclara los avisos N/D, NO SOP., EST y SIM.
+  ARRIBA/ABAJO desplaza la lista. Es solo informativo.
+
+  ESTILO POR TEMA: el tema no solo cambia los colores. Cada tema de
+  juego tiene relojes, agujas e indicadores distintos:
+    FORZA         escala en bloques separados, aguja triangular ancha
+                  con punta blanca, cubo grande, letra negrita, barra
+                  de boost troceada y franjas rosas en los indicadores.
+    NFS           aros dobles finos, aguja doble con punta de flecha y
+                  estela neon, marcas exteriores, barra digital de RPM
+                  segmentada, letra cursiva con halo y barra de boost
+                  por celdas neon.
+    GRAN TURISMO  escala fina con aro tecnico, numeros 0-7 alrededor,
+                  zona roja rayada, aguja roja con contrapeso, barra de
+                  boost fina con marcas y linea superior en indicadores.
+    INITIAL D     bezel grueso de doble aro, numeros 0-7, marcas largas,
+                  aguja blanca con filo rojo, cubo negro/blanco/rojo,
+                  banda a cuadros, letra cursiva retro y marco blanco
+                  en la barra de boost.
+  El tema NORMAL (colores QV ROSSO/VERDE/AMBAR/AZZURRO/MONO) mantiene
+  el estilo clasico de aguja de arco.
+
+  EFECTOS DE LOS TEMAS DE JUEGO:
+    INITIAL D     campaneo de aviso al superar 100 km/h (fijo, no se
+                  ajusta). Suena como el aviso del AE86 mientras se
+                  mantiene por encima del limite y muestra AVISO
+                  parpadeando. Son dos campanas seguidas, "tin" mas
+                  aguda y "tun" mas grave, con 0,90 s de pausa: un
+                  aviso cada 1,30 s.
+                  Si copias tu propio archivo chime.wav en la carpeta
+                  de la app, se usa ese sonido en lugar del sintetizado.
+    NFS           si aceleras fuerte aparece NITRO: tinte azul, estelas
+                  laterales, borde neon y una barra que sube con la
+                  aceleracion y baja al soltar el pedal.
+    FORZA         al acelerar con fuerza aparece un marcador de SKILL
+                  con puntos que suben mientras mantengas el empuje.
+    GRAN TURISMO  medidor de G calculado con la velocidad y aviso
+                  rojo intermitente al llegar a la zona roja.
+  Todos los efectos se calculan con la velocidad ya leida del coche
+  (o con el modo demo); no se inventa ningun dato nuevo.
+
+  SONIDO PROPIO (chime.wav)
+    Copia el archivo en la misma carpeta que el EBOOT:
+      ms0:/PSP/GAME/PSPTorqueOBD/chime.wav
+    Formato recomendado: WAV PCM 16 bits, mono o estereo, 44100 Hz.
+    La app lo convierte sola si esta a otra frecuencia y lo repite
+    mientras estes por encima de 100 km/h, dejando 0,90 s de pausa
+    entre repeticiones. Si el archivo no existe o
+    no es WAV PCM valido, usa el campaneo sintetizado. El archivo lo
+    aporta el usuario; la app no incluye audio con derechos de autor.
+
+  TURBO AUTO: mientras esta activo, la app guarda el mayor boost visto
+  a plena carga (carga o acelerador >= 90% y RPM >= 3000) y usa ese
+  valor +15% como fondo de escala del reloj de turbo. El valor se
+  conserva entre sesiones; CIRCLE lo borra y vuelve al fondo manual.
+
+  UNIDADES: el cambio es solo de presentacion; el coche se sigue
+  leyendo en metrico y el log guarda siempre las unidades originales.
+
+MODO DEMO
+  Manten L+R durante 1,5 segundos en cualquier pantalla. Aparece DEMO
+  en la cabecera y el dashboard empieza a mostrar un coche simulado:
+  ralenti, aceleracion hasta 130, crucero, estirada hasta 185, frenada
+  y vuelta a empezar. Los valores llevan la marca SIM en el log.
+  - No necesita ELM327 ni coche: sirve para probar temas, disenos,
+    unidades y el aprendizaje de turbo.
+  - Se desactiva con el mismo combo L+R. Al salir del demo se recupera
+    el estado real (o N/D si no hay adaptador).
+  - Conectar con TRIANGLE/SQUARE tambien desactiva el demo.
+
+DESCUBRIMIENTO DE MODULOS (pantalla MODULOS)
+  Pulsa L/R hasta MODULOS y despues X. La app hace un escaneo de solo
+  lectura y muestra que centralitas contestan:
+
+  1) OBD-II estandar
+     En CAN, todas las centralitas oyen la peticion funcional. Con las
+     cabeceras activadas se ve el CAN ID de cada respuesta (7E8, 7E9...
+     en CAN de 11 bits; 18DAF1xx en CAN de 29 bits) y las mascaras
+     0100/0120/0140 de cada modulo. Es lo que usa la app para saber que
+     PIDs existen.
+
+  2) UDS de identificacion
+     - CAN de 11 bits: se prueba Tester Present (3E00) en 7E0-7E7.
+     - CAN de 29 bits: se prueba la direccion funcional 18DB33F1 y
+       despues las direcciones fisicas 18DA00F1-18DAFFF1. Es el caso
+       de muchos coches modernos (Renault, PSA, etc.).
+     Si un modulo contesta, se leen estos DIDs estandar de
+     identificacion:
+       F190  VIN
+       F197  nombre del sistema / tipo de motor
+       F187  referencia de pieza
+       F188  version de software
+       F18C  numero de serie
+     Todo son servicios de lectura. No se escribe nada, no se borran
+     codigos y no se envian actuadores.
+
+  LIMITES IMPORTANTES
+  - La centralita de motor suele ser la unica que habla OBD-II modo 01.
+  - ABS, airbag, carroceria y suspension suelen usar diagnosticos de
+    fabricante (modo 22 / UDS con DIDs propietarios). El escaneo puede
+    detectarlas y leer su identificacion estandar, pero NO puede mostrar
+    sus datos en vivo sin conocer los DIDs concretos de ese modelo.
+  - Los datos de suspension, presion de turbo objetivo, DPF, EGR, etc.
+    no son universales y no se inventan.
+  - Si el coche tiene un gateway de seguridad, puede bloquear algunas
+    direcciones; el escaneo mostrara solo lo que el gateway permita.
+  - El escaneo tarda entre 10 y 30 segundos en CAN de 11 bits, y algo
+    mas en CAN de 29 bits (sondea 256 direcciones fisicas). Se puede
+    cancelar con CIRCLE.
+
+  El resultado completo, incluidas las respuestas crudas, queda en el
+  log de la sesion. Con ese log se puede preparar despues un perfil de
+  lectura especifico para una centralita concreta.
+
+PASOS
+  1. Sal del modo USB (boton O / CIRCLE).
+  2. Enciende el ELM327 y pon el CONTACTO, con el motor PARADO.
+  3. Juego > Memory Stick > PSP Torque.
+  4. La app abre el dashboard al instante y, por detras, intenta conectar
+     sola a la red guardada (perfil 1). No abre ningun dialogo.
+     Veras "CONECTANDO WIFI" y luego "BUSCANDO ELM327" sobre el dashboard.
+  5. Si no conecta, el dashboard queda en N/D con el aviso SIN WIFI o
+     SIN ADAPTADOR:
+       TRIANGLE  reintenta el perfil guardado
+       SQUARE    abre el dialogo WiFi de la PSP para elegir tu red
+  6. Con el motor parado se captura el baro KEY-ON (fuente KEY).
+  7. Arranca el motor y dejalo al ralenti 30-60 segundos.
+     Acelera suavemente para ver MAP/BOOST y mover el tacometro.
+  8. Para terminar: START (abre el menu) > SALIR > X. Se muestra el
+     resumen de texto; pulsa START otra vez para salir.
+  9. Activa el modo USB y avisa para leer el log.
+
+SIN ADAPTADOR
+  Si el ELM327 no esta encendido o no se conecta, la app muestra
+  igualmente el dashboard grafico con todos los valores en N/D y el
+  estado DESCONECT. Sirve para probar la interfaz sin el coche.
+  Pulsa TRIANGLE para reintentar WiFi, SQUARE para configurarlo,
+  L/R para cambiar de pantalla, L+R 1,5 s para el modo demo y
+  START > SALIR > X para salir.
+
+RESULTADO
+  Un archivo de log por sesion, sin borrar los anteriores:
+    ms0:/PSP/GAME/PSPTorqueOBD/phase1_AAAAMMDD_HHMMSS.log
+  Si el reloj de la PSP no es valido, usa numeracion correlativa:
+    phase1_001.log, phase1_002.log, ...
+
+QUE MIRAR
+  - "mascara 0100", "mascara 0120" y "mascara 0140": que PIDs existen.
+  - "BARO: ..." al final: PID 0x33, KEY-ON o fallback EST.
+  - Lineas "t=... rpm=... map=... boost=...".
+  - "RESULTADO: OK" si hubo datos sin cortes, o "RESULTADO: OK (N cortes)"
+    si hubo cortes de enlace que se recuperaron.
+
+  Si un valor sale N/D, ese PID no esta disponible.
+  Si BOOST sale EST, el baro es el fallback: no es una medida real.
+  Si el motor esta parado, RPM=0 y MAP ~97-101 kPa es normal.
+  El avance de encendido (0x0E) no se muestra: esta ECU devuelve
+  valores fisicamente imposibles con la escala estandar de OBD-II.
+  Solo lectura: la app nunca escribe en la ECU ni borra codigos.
