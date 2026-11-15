@@ -144,23 +144,62 @@ Reglas:
 El ELM327 WiFi no es rápido: el cuello de botella real es el enlace serie
 interno ELM327↔ECU y la ECU. No se puede pedir 20 PID a 20 Hz.
 
-Ejemplo de planificación QV:
+### 5.1 Lo que mide el enlace (FASE E)
+
+Medido sobre un clon ELM327 v1.5 por WiFi en un viaje real (`phase1_067`,
+log limpio de 124 s):
+
+| Magnitud | Valor |
+|---|---|
+| Ida y vuelta de un comando `AT` (sin CAN) | 9–20 ms |
+| Ida y vuelta de una petición de PID | 50–67 ms (modo ~61 ms) |
+| Coste por ciclo completo (envío + respuesta + hueco) | ~72 ms |
+| Peticiones por segundo sustainable | ~12,6 |
+
+De esos ~72 ms, **~26 ms eran culpa nuestra** (FASE E1): la respuesta solo se
+podía detectar en el siguiente frame (16,7 ms de cuantización) y el comando
+siguiente salía en la iteración posterior (16,7 ms de hueco muerto). El suelo
+del hardware son los ~46 ms restantes.
+
+Con el sondeo desacoplado del render (E1) el ciclo baja a ~55 ms y el enlace
+da ~18 peticiones/s.
+
+### 5.2 La demanda tiene que caber en la capacidad
+
+Si la suma de `1000/periodo` de todos los PID que la app puede sondear supera
+la capacidad del enlace, **el planificador se satura y todos los PID se
+refrescan más tarde de lo pedido**, aunque cada uno pida un periodo corto.
+Antes de la FASE E la app pedía 48,9 req/s contra 12,6 disponibles: el RPM
+pasaba de pedir 100 ms a refrescarse cada **765 ms**.
+
+El presupuesto vive en `PROFILE_LINK_BUDGET_REQ_S` y hay un test del núcleo
+(`test_link_budget`) que calcula la demanda en el caso peor y falla si se
+supera. Es la red de seguridad de esta sección.
+
+### 5.3 Planificación vigente
 
 | Parámetro | PID | Periodo | Prioridad |
 |---|---|---|---|
-| RPM | 0x0C | 100 ms | alta |
-| MAP | 0x0B | 100 ms | alta |
-| Velocidad | 0x0D | 200 ms | media |
-| ECT | 0x05 | 1000 ms | baja |
-| IAT | 0x0F | 1000 ms | baja |
-| Baro | 0x33 | 5000 ms | baja (si existe) |
+| RPM | 0x0C | 350 ms | alta |
+| MAP | 0x0B | 350 ms | alta |
+| Velocidad | 0x0D | 700 ms | media |
+| Mariposa | 0x11 | 700 ms | media |
+| Pedal | 0x49 / 0x4A | 700 ms | media |
+| Carga | 0x04 | 1000 ms | media |
+| ECT | 0x05 | 2000 ms | baja |
+| IAT | 0x0F | 2000 ms | baja |
+| STFT / LTFT / avance / O2 / distancia | 0x06, 0x07, 0x0E, 0x14, 0x15, 0x21 | 3000 ms | baja |
+| Tensión | 0x42 | 5000 ms | baja (si existe) |
+| Aceite | 0x5C | 5000 ms | baja (si existe) |
+| Baro | 0x33 | 10000 ms | baja (si existe) |
+| Combustible | 0x2F | 10000 ms | baja (si existe) |
 
 `BOOST` no se pide: se calcula a partir de MAP y baro.
 
 Estrategia:
 
-- En cada tick (p. ej. 20 ms), el scheduler encola como máximo un comando.
-- Si la cola está llena o hay un comando en vuelo, no se encola otro.
+- En cada tick, el scheduler encola como máximo un comando.
+- Si hay un comando en vuelo, no se encola otro.
 - Se salta PID cuyo periodo no ha vencido.
 - Al entrar en ENGINE, se reparte el ancho de banda entre más PID (periodos
   mayores) y se da prioridad a MAP/boost.
@@ -168,6 +207,27 @@ Estrategia:
   deja de pedir hasta la próxima sesión (o reintento manual).
 - Medir el tiempo real de ida y vuelta y adaptar los periodos si el bus va
   lento; no bloquear la UI.
+
+### 5.4 El sondeo no depende del frame (FASE E1)
+
+El bucle principal hace las dos cosas (dibujar y sondear). Antes de la FASE E
+el sondeo solo avanzaba una vez por frame, lo que añadía ~26 ms a cada
+petición. Ahora:
+
+- Mientras hay una petición en vuelo (o acaba de completarse) la espera es
+  de **2 ms** en vez de un VBlank completo (16,7 ms).
+- La cadencia de **dibujo** no cambia: sigue governed por la cuenta de
+  VBlanks, así que los FPS no se resienten.
+
+### 5.5 El suavizado es un filtro de tiempo, no de muestras (FASE E3)
+
+Un filtro exponencial con factor de mezcla fijo tiene un retardo que depende
+de la cadencia de muestreo: con factor 0,3 y RPM a 1,3 Hz, el indicador
+tardaba **2,1 s** en llegar al 63% del valor real. Ese era el retardo visible.
+
+El filtro del núcleo (`obd_smooth`) usa constante de tiempo fija
+(`tau = 150 ms`): `alpha = 1 - exp(-dt/tau)`. El retardo es siempre `tau`,
+venga la cadencia como venga.
 
 ## 6. Modelo de muestra
 

@@ -52,7 +52,10 @@ capacidades reales de cualquier ECU.
 - **Log por sesión** en la Memory Stick, con métricas de rendimiento
   (CPU, espera, VBlanks, vértices) y resumen final de la sesión.
 - **Latencia baja:** lectura OBD no bloqueante, una sola petición en vuelo y
-  cadencia de dibujo sincronizada con VBlank.
+  cadencia de dibujo sincronizada con VBlank. El sondeo **no** depende del
+  frame: la respuesta se detecta en ~2 ms en vez de esperar al siguiente
+  frame, y la cadencia de cada PID está calibrada contra la capacidad real
+  del enlace, no contra lo que el coche "debería" dar.
 
 ## Requisitos
 
@@ -221,7 +224,7 @@ powershell -ExecutionPolicy Bypass -File tools\elm327_sim.ps1
 ```
 .
 ├── include/obd/     Cabeceras del núcleo portable (C99, sin dependencias de PSP)
-├── src/core/        Parser ELM327, PIDs, boost/baro, scheduler, muestras, discovery
+├── src/core/        Parser ELM327, PIDs, boost/baro, scheduler, muestras, discovery, suavizado
 ├── src/psp/         Capa PSP: GU, fuentes, entrada, audio, red y bucle principal
 ├── tests/           Pruebas del núcleo en PC (gcc nativo)
 ├── tools/           Build en Docker, simulador ELM327 y lector de logs
@@ -257,6 +260,19 @@ powershell -ExecutionPolicy Bypass -File tools\elm327_sim.ps1
   y avanza su estado una vez por iteración del bucle. Nunca se envía un
   comando nuevo mientras hay otro pendiente, y la interfaz nunca se bloquea
   esperando una respuesta.
+- **Sondeo desacoplado del render:** mientras hay una petición en vuelo, el
+  bucle espera 2 ms en vez de un VBlank completo (16,7 ms). Antes, esa espera
+  añadía ~26 ms a cada petición y limitaba el enlace a 12,6 peticiones/s;
+  ahora da ~18. La cadencia de dibujo no cambia: sigue contando VBlanks.
+- **Cadencia calibrada contra el enlace:** los periodos de sondeo de cada PID
+  están ajustados a la capacidad medida del adaptador (~18 peticiones/s con
+  un clon ELM327 v1.5 por WiFi). Si la demanda total los superara, el
+  planificador se saturaría y **todos** los indicadores irían con retraso.
+  Un test del núcleo calcula esa demanda y falla si se pasa del presupuesto.
+- **Suavizado con constante de tiempo fija:** el filtro de los indicadores
+  tiene un retardo de 150 ms con independencia de la cadencia de muestreo,
+  así que la aguja sigue al acelerón sin los 2,1 s de retardo de un filtro
+  de factor fijo.
 - **Cadencia por VBlank:** el dibujo se sincroniza con `sceDisplayGetVcount()`
   en lugar de con temporizadores, y el número de VBlanks por fotograma se
   ajusta solo según la carga de CPU.
@@ -318,9 +334,11 @@ Estas reglas son la razón de ser del proyecto y no se negocian:
 
 ## Roadmap
 
-- Lectura OBD no bloqueante con reconexión automática. *(en curso)*
+- Lectura OBD no bloqueante con reconexión automática. *(hecho)*
+- Cadencia de sondeo y suavizado recalibrados contra el enlace real. *(hecho)*
 - Perfil de vehículo editable desde la PSP.
 - Exportación CSV de la sesión con formato largo.
+- Sondear en alta cadencia solo lo que la pantalla activa necesita.
 - Soporte de mas de una PSP (PSP‑E1000 sin WiFi, PSP‑Street).
 - Perfiles específicos de fabricante, siempre documentados y validados.
 

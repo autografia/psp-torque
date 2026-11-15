@@ -32,6 +32,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
@@ -43,6 +44,7 @@
 #include "obd/profile.h"
 #include "obd/samples.h"
 #include "obd/scheduler.h"
+#include "obd/smooth.h"
 
 #include "gfx.h"
 #include "audio.h"
@@ -58,7 +60,7 @@ PSP_HEAP_SIZE_KB(4096);
 #define DEFAULT_HOST "192.168.0.10"
 #define DEFAULT_PORT 35000
 #define MAX_TARGETS 4
-#define BUILD_TAG "fase2.39 2026-11-15 FASE D3 reconexion no bloqueante + nombre PSP Torque"
+#define BUILD_TAG "fase2.40 2026-11-15 FASE E1+E2+E3 latencia: sondeo desacoplado del render, cadencia recalibrada y suavizado con tau fijo"
 #define CMD_TIMEOUT_MS 500
 /* Si el adaptador ha demostrado que envia el prompt '>', hay que esperarlo
  * antes de mandar el siguiente comando. El ELM327 hace tareas internas
@@ -122,15 +124,11 @@ static float g_peak_rpm = 0.0f;
 static float g_peak_speed = 0.0f;
 static float g_peak_boost = 0.0f;
 
-/* Suavizado EMA. */
-static float g_ema_rpm = 0.0f;
-static float g_ema_map = 0.0f;
-static float g_ema_speed = 0.0f;
-static float g_ema_thr = 0.0f;
-static int g_ema_rpm_init = 0;
-static int g_ema_map_init = 0;
-static int g_ema_speed_init = 0;
-static int g_ema_thr_init = 0;
+/* Suavizado EMA con constante de tiempo fija (FASE E3). */
+static obd_smooth g_ema_rpm;
+static obd_smooth g_ema_map;
+static obd_smooth g_ema_speed;
+static obd_smooth g_ema_thr;
 
 /* ------------------------------------------------------------------ */
 /* Estado de la UI grafica.                                           */
@@ -714,7 +712,10 @@ static void settings_apply(void)
     gfx_theme_apply(preset, g_cfg.contrast);
     audio_set_gap_ms(g_cfg.chime_gap * 100);
     if (!g_cfg.smooth) {
-        g_ema_rpm_init = g_ema_map_init = g_ema_speed_init = g_ema_thr_init = 0;
+        obd_smooth_reset(&g_ema_rpm);
+        obd_smooth_reset(&g_ema_map);
+        obd_smooth_reset(&g_ema_speed);
+        obd_smooth_reset(&g_ema_thr);
     }
     if (g_link_connected) {
         build_scheduler();
@@ -2096,6 +2097,15 @@ static void elm_send_and_read(int sock, const char *cmd, int wait_ms,
 }
 
 
+/* ------------------------------------------------------------------ */
+/* Suavizado exponencial con constante de tiempo fija (FASE E3).      */
+/* ------------------------------------------------------------------ */
+
+/* El retardo que introduce el filtro esta en el nucleo (obd_smooth):
+ * tau = 150 ms. Con un factor de mezcla fijo (0,3) el retardo
+ * dependia de la cadencia de muestreo y el tacometro tardaba 2,1 s en
+ * seguir al aceleron. Con tau fijo el retardo es siempre el mismo. */
+
 static void store_value(uint8_t pid, const elm_frame *frame, uint32_t ts)
 {
     obd_pid_value value;
@@ -2106,24 +2116,16 @@ static void store_value(uint8_t pid, const elm_frame *frame, uint32_t ts)
 
     float v = value.value;
 
-    /* Suavizado EMA opcional. */
+    /* Suavizado EMA opcional (constante de tiempo fija). */
     if (g_cfg.smooth) {
         if (pid == 0x0C) {
-            if (!g_ema_rpm_init) { g_ema_rpm = v; g_ema_rpm_init = 1; }
-            else g_ema_rpm = g_ema_rpm * 0.7f + v * 0.3f;
-            v = g_ema_rpm;
+            v = obd_smooth_apply(&g_ema_rpm, v, ts);
         } else if (pid == 0x0B) {
-            if (!g_ema_map_init) { g_ema_map = v; g_ema_map_init = 1; }
-            else g_ema_map = g_ema_map * 0.7f + v * 0.3f;
-            v = g_ema_map;
+            v = obd_smooth_apply(&g_ema_map, v, ts);
         } else if (pid == 0x0D) {
-            if (!g_ema_speed_init) { g_ema_speed = v; g_ema_speed_init = 1; }
-            else g_ema_speed = g_ema_speed * 0.7f + v * 0.3f;
-            v = g_ema_speed;
+            v = obd_smooth_apply(&g_ema_speed, v, ts);
         } else if (pid == g_thr_pid) {
-            if (!g_ema_thr_init) { g_ema_thr = v; g_ema_thr_init = 1; }
-            else g_ema_thr = g_ema_thr * 0.7f + v * 0.3f;
-            v = g_ema_thr;
+            v = obd_smooth_apply(&g_ema_thr, v, ts);
         }
     }
 
@@ -2173,11 +2175,6 @@ static void apply_support_masks(void)
 
 static void build_scheduler(void)
 {
-    static const obd_poll_def extra[] = {
-        { 0x11, 200, 1 },   /* mariposa (siempre disponible) */
-        { 0x04, 250, 1 }    /* carga */
-    };
-
     obd_sched_init(&g_sched);
 
     /* Soporte real declarado por las mascaras de la ECU. */
@@ -2189,44 +2186,46 @@ static void build_scheduler(void)
                                 PROFILE_QV_POLL[i].period_ms,
                                 PROFILE_QV_POLL[i].priority);
     }
-    for (unsigned i = 0; i < sizeof(extra) / sizeof(extra[0]); i++) {
-        if (obd_mask_supports(g_mask1, extra[i].pid)) {
+    for (int i = 0; i < PROFILE_EXTRA_POLL_COUNT; i++) {
+        if (obd_mask_supports(g_mask1, PROFILE_EXTRA_POLL[i].pid)) {
             /* Modo rapido: se salta la carga para acortar el barrido. */
-            if (g_cfg.fast && extra[i].pid == 0x04) {
+            if (g_cfg.fast && PROFILE_EXTRA_POLL[i].pid == 0x04) {
                 continue;
             }
-            obd_sched_add(&g_sched, extra[i].pid, extra[i].period_ms,
-                                    extra[i].priority);
+            obd_sched_add(&g_sched, PROFILE_EXTRA_POLL[i].pid,
+                          PROFILE_EXTRA_POLL[i].period_ms,
+                          PROFILE_EXTRA_POLL[i].priority);
         }
     }
 
     /* Si el coche no tiene MAP pero si MAF, se usa MAF como medida
      * principal. El boost no se puede calcular sin MAP. */
     if (!g_map_supported && g_maf_supported) {
-        obd_sched_add(&g_sched, 0x10, 200, 1);
+        obd_sched_add(&g_sched, 0x10, PROFILE_PID_MAF_PERIOD_MS, 1);
     }
 
     /* 0x42: tension del modulo, solo si el bloque 0x40 lo soporta y
      * no estamos en modo rapido. */
     if (!g_cfg.fast && (g_mask3 & 0x40000000u)) {
-        obd_sched_add(&g_sched, 0x42, 2000, 3);
+        obd_sched_add(&g_sched, 0x42, PROFILE_PID_VOLT_PERIOD_MS, 3);
     }
 
     /* Aceite y combustible, solo si estan soportados. */
     g_oil_supported = (g_mask3 & 0x00000010u) ? 1 : 0;
     g_fuel_supported = (g_mask2 & 0x00020000u) ? 1 : 0;
     if (!g_cfg.fast && g_oil_supported) {
-        obd_sched_add(&g_sched, 0x5C, 2000, 4);
+        obd_sched_add(&g_sched, 0x5C, PROFILE_PID_OIL_PERIOD_MS, 4);
     }
     if (!g_cfg.fast && g_fuel_supported) {
-        obd_sched_add(&g_sched, 0x2F, 5000, 4);
+        obd_sched_add(&g_sched, 0x2F, PROFILE_PID_FUEL_PERIOD_MS, 4);
     }
 
     /* Motor avanzado: trims, avance, lambda, distancia con MIL. */
     if (!g_cfg.fast) {
-        const uint8_t motor_pids[] = { 0x06, 0x07, 0x0E, 0x14, 0x15, 0x21 };
-        for (size_t i = 0; i < sizeof(motor_pids); i++) {
-            obd_sched_add(&g_sched, motor_pids[i], 1000, 3);
+        for (int i = 0; i < PROFILE_MOTOR_POLL_COUNT; i++) {
+            obd_sched_add(&g_sched, PROFILE_MOTOR_POLL[i].pid,
+                          PROFILE_MOTOR_POLL[i].period_ms,
+                          PROFILE_MOTOR_POLL[i].priority);
         }
     }
 
@@ -2237,12 +2236,12 @@ static void build_scheduler(void)
     g_thr_label = "MARIPOSA";
     g_pedal_supported = 0;
     if (g_mask3 & 0x00800000u) {          /* bit 0x49 */
-        obd_sched_add(&g_sched, 0x49, 200, 1);
+        obd_sched_add(&g_sched, 0x49, PROFILE_PID_PEDAL_PERIOD_MS, 1);
         g_thr_pid = 0x49;
         g_thr_label = "ACELERADOR";
         g_pedal_supported = 1;
     } else if (g_mask3 & 0x00400000u) {   /* bit 0x4A */
-        obd_sched_add(&g_sched, 0x4A, 200, 1);
+        obd_sched_add(&g_sched, 0x4A, PROFILE_PID_PEDAL_PERIOD_MS, 1);
         g_thr_pid = 0x4A;
         g_thr_label = "ACELERADOR";
         g_pedal_supported = 1;
@@ -7231,6 +7230,9 @@ static void run_dashboard(Target *targets, int target_count)
     int rx_idx = -1;
     uint8_t rx_pid = 0;
     uint32_t rx_t0 = 0;
+    /* FASE E1: la peticion se acaba de completar; la siguiente espera
+     * es fina (2 ms) para que el comando siguiente salga ya. */
+    int rx_just_done = 0;
     memset(&rx, 0, sizeof(rx));
 
     for (;;) {
@@ -7385,7 +7387,6 @@ static void run_dashboard(Target *targets, int target_count)
                 rx_ready = 1;
             }
         }
-
         if (rx_ready) {
             elm_reply *reply = &rx.reply;
             uint8_t pid = rx_pid;
@@ -7460,6 +7461,12 @@ static void run_dashboard(Target *targets, int target_count)
             }
 
             memset(&rx, 0, sizeof(rx));
+
+            /* FASE E1: la peticion acaba de completarse. Se marca para
+             * que la espera siguiente sea de 2 ms y no un VBlank entero:
+             * asi el siguiente comando sale de inmediato en vez de
+             * esperar 16,7 ms al frame siguiente. */
+            rx_just_done = 1;
         }
 
         /* FASE D3: reconexion automatica no bloqueante. La espera entre
@@ -7517,11 +7524,27 @@ static void run_dashboard(Target *targets, int target_count)
         if (draw_due) {
             draw_screen(now, requests, data_count,
                         no_data_count, timeouts, last_rtt);
+        } else if (rx.active || rx_just_done) {
+            /* FASE E1: hay una peticion OBD en vuelo (o acaba de
+             * completarse). En vez de esperar un VBlank entero
+             * (16,7 ms), se duerme 2 ms y se vuelve a mirar el socket.
+             *
+             * Antes, la deteccion de la respuesta solo podia ocurrir en
+             * el siguiente frame, y el siguiente comando salia en la
+             * iteracion posterior: 16,7 ms de cuantizacion + 16,7 ms de
+             * hueco muerto en cada peticion. Medido sobre el log de un
+             * viaje real, eran ~26 ms de los ~72 ms de cada ciclo.
+             * Con 2 ms el ciclo baja a ~55 ms y el enlace da ~18
+             * peticiones/s en vez de 12,6.
+             *
+             * El dibujo no se resiente: la cadencia sigue la cuenta de
+             * VBlanks, no la del bucle. */
+            sceKernelDelayThread(2000);
         } else {
-            /* Nada que dibujar: un VBlank como referencia. La peticion
-             * OBD en vuelo avanza en la siguiente iteracion (~60 Hz). */
+            /* Nada que dibujar: un VBlank como referencia. */
             sceDisplayWaitVblankStart();
         }
+        rx_just_done = 0;
 
         if ((uint32_t)(now - last_status) >= 2000u) {
             float f;

@@ -52,7 +52,10 @@ whatever your ECU actually supports.
 - **Per-session log** on the Memory Stick, including performance metrics
   (CPU, wait, VBlanks, vertices) and a final session summary.
 - **Low latency:** non-blocking OBD reads, only one request in flight, and a
-  draw cadence locked to VBlank.
+  draw cadence locked to VBlank. Polling **does not** depend on the frame:
+  the reply is detected in ~2 ms instead of waiting for the next frame, and
+  each PID's rate is calibrated against the link's real capacity, not against
+  what the car "should" deliver.
 
 ## Requirements
 
@@ -218,7 +221,7 @@ powershell -ExecutionPolicy Bypass -File tools\elm327_sim.ps1
 ```
 .
 ├── include/obd/     Portable core headers (C99, no PSP dependency)
-├── src/core/        ELM327 parser, PIDs, boost/baro, scheduler, samples, discovery
+├── src/core/        ELM327 parser, PIDs, boost/baro, scheduler, samples, discovery, smoothing
 ├── src/psp/         PSP layer: GU, fonts, input, audio, network, main loop
 ├── tests/           Core unit tests (native gcc)
 ├── tools/           Docker build, ELM327 simulator, log reader
@@ -253,6 +256,18 @@ powershell -ExecutionPolicy Bypass -File tools\elm327_sim.ps1
   advances its state once per loop iteration. A new command is never sent
   while another one is pending, and the interface never blocks waiting for a
   reply.
+- **Polling decoupled from rendering:** while a request is in flight the loop
+  waits 2 ms instead of a full VBlank (16.7 ms). That wait used to add
+  ~26 ms to every request and capped the link at 12.6 requests/s; now it
+  delivers ~18. The draw cadence does not change: it still counts VBlanks.
+- **Rate calibrated against the link:** every PID's polling period is fitted
+  to the adapter's measured capacity (~18 requests/s with a WiFi ELM327 v1.5
+  clone). If the total demand exceeded it, the scheduler would saturate and
+  **every** gauge would lag. A core test computes that demand and fails if
+  it goes over budget.
+- **Smoothing with a fixed time constant:** the gauge filter has a 150 ms
+  delay regardless of the sampling rate, so the needle follows the throttle
+  without the 2.1 s lag of a fixed-factor filter.
 - **VBlank cadence:** drawing is synchronised with `sceDisplayGetVcount()`
   instead of with timers, and the number of VBlanks per frame adapts
   automatically to the CPU load.
@@ -310,9 +325,11 @@ These rules are the reason the project exists and they are not negotiable:
 
 ## Roadmap
 
-- Non-blocking OBD reads with automatic reconnection. *(in progress)*
+- Non-blocking OBD reads with automatic reconnection. *(done)*
+- Polling rate and smoothing recalibrated against the real link. *(done)*
 - Vehicle profile editable from the PSP.
 - Session CSV export in long format.
+- Poll at high rate only what the visible screen needs.
 - Support for more PSP models (PSP‑E1000 has no WiFi, PSP‑Street).
 - Manufacturer-specific profiles, always documented and validated.
 

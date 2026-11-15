@@ -119,6 +119,42 @@ Criterios de aceptacion:
 - [ ] Sin cortes de bus prolongados ni desincronizacion de respuestas tras
       reconectar (medido sobre el log de una sesion real en coche).
 
+## Fase 2.6 — Latencia de la lectura (FASE E)
+
+Objetivo: que el panel refleje el coche sin retardo perceptible. Antes de
+esta fase, acelerar tardaba ~1,5 s en verse en el tacometro.
+
+Estado: **E1, E2 y E3 implementados** (`fase2.40`); pendiente de validacion
+en hardware.
+
+Diagnostico (sobre `phase1_067`, el log limpio de un viaje real): el RPM se
+refrescaba cada **765 ms** en vez de cada 100 ms, y el suavizado anadia otros
+**2,1 s**. Tres causas encadenadas:
+
+1. [x] **E1 — El sondeo estaba acoplado al frame.** La respuesta solo se
+   detectaba en el siguiente frame (16,7 ms) y el comando siguiente salia en
+   la iteracion posterior (16,7 ms): ~26 ms de cada ciclo eran nuestros. Con
+   una espera de 2 ms mientras hay peticion en vuelo, el ciclo baja de ~72 a
+   ~55 ms.
+2. [x] **E2 — El planificador estaba saturado x3,9.** Se pedian 48,9
+   peticiones/s contra 12,6 disponibles, asi que todos los PID se degradaban
+   a la vez. Los periodos se recalibraron a la capacidad real del enlace
+   (presupuesto `PROFILE_LINK_BUDGET_REQ_S`, con test que lo vigila).
+3. [x] **E3 — El suavizado estaba calibrado para 10 Hz y recibia 1,3 Hz.**
+   Con factor de mezcla fijo (0,3) el retardo dependia de la cadencia: 2,1 s
+   hasta el 63% del valor real. Ahora es un filtro de constante de tiempo
+   fija (`tau = 150 ms`), con tests propios en el nucleo.
+
+Criterios de aceptacion:
+
+- [x] La demanda total del planificador cabe en la capacidad del enlace
+      (test `test_link_budget`).
+- [x] El suavizado tiene retardo constante, independiente de la cadencia
+      (test `test_smooth`).
+- [x] Ninguna escritura a la ECU.
+- [ ] El RPM se refresca a >= 2,5 Hz en el coche (era 1,31 Hz).
+- [ ] El retardo percibido al acelerar es < 0,5 s (era ~1,5 s).
+
 ## Fase 3 — Parámetros específicos Alfa Romeo (investigación)
 
 Tareas:

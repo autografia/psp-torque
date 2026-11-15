@@ -1,12 +1,15 @@
 #include "obd/profile.h"
 #include "test_util.h"
 
+#include <stdio.h>
+
 void test_parser(void);
 void test_pid(void);
 void test_boost(void);
 void test_scheduler(void);
 void test_samples(void);
 void test_discovery(void);
+void test_smooth(void);
 
 int g_failures = 0;
 
@@ -16,9 +19,70 @@ static void test_profile(void)
     CHECK(PROFILE_ENGINE_POLL_COUNT >= 10);
     CHECK(PROFILE_QV_POLL[0].pid == 0x0C);
     CHECK(PROFILE_QV_POLL[1].pid == 0x0B);
-    CHECK(PROFILE_QV_POLL[0].period_ms == 100);
+    CHECK(PROFILE_QV_POLL[0].period_ms == 350);
+    CHECK(PROFILE_QV_POLL[1].period_ms == 350);
     CHECK(PROFILE_BARO_FALLBACK_KPA > 50.0f);
     CHECK(PROFILE_BARO_FALLBACK_KPA < 110.0f);
+}
+
+/* FASE E2: el presupuesto de peticiones del planificador.
+ *
+ * El enlace ELM327 WiFi da ~18 peticiones/s (unos 55 ms por peticion
+ * completa: envio, respuesta del coche y hueco entre peticiones). Si la
+ * suma de 1000/periodo de todos los PID que la app puede llegar a
+ * sondear supera ese techo, el planificador se satura y TODOS los PID
+ * se refrescan mas tarde de lo pedido: el RPM pasaria de 350 ms a
+ * 700-800 ms y el tacometro iria con retraso.
+ *
+ * Este test calcula la demanda en el caso peor (todos los PID opcionales
+ * presentes a la vez) y la compara con el presupuesto. Es la regresion
+ * que habria que volver a tocar si alguien baja los periodos. */
+static void test_link_budget(void)
+{
+    float demand = 0.0f;
+
+    for (int i = 0; i < PROFILE_QV_POLL_COUNT; i++) {
+        demand += 1000.0f / (float)PROFILE_QV_POLL[i].period_ms;
+    }
+    for (int i = 0; i < PROFILE_EXTRA_POLL_COUNT; i++) {
+        demand += 1000.0f / (float)PROFILE_EXTRA_POLL[i].period_ms;
+    }
+    for (int i = 0; i < PROFILE_MOTOR_POLL_COUNT; i++) {
+        demand += 1000.0f / (float)PROFILE_MOTOR_POLL[i].period_ms;
+    }
+
+    /* PID que solo se sondean si la mascara los soporta. */
+    demand += 1000.0f / (float)PROFILE_PID_MAF_PERIOD_MS;
+    demand += 1000.0f / (float)PROFILE_PID_PEDAL_PERIOD_MS;
+    demand += 1000.0f / (float)PROFILE_PID_VOLT_PERIOD_MS;
+    demand += 1000.0f / (float)PROFILE_PID_OIL_PERIOD_MS;
+    demand += 1000.0f / (float)PROFILE_PID_FUEL_PERIOD_MS;
+
+    printf("  demanda del planificador: %.2f req/s (presupuesto %.1f)\n",
+           demand, (double)PROFILE_LINK_BUDGET_REQ_S);
+
+    CHECK(demand <= PROFILE_LINK_BUDGET_REQ_S);
+
+    /* Y al reves: si la demanda cae mucho, se esta desaprovechando el
+     * enlace y el panel se queda mas lento de lo necesario. */
+    CHECK(demand >= PROFILE_LINK_BUDGET_REQ_S * 0.60f);
+
+    /* El RPM y el MAP son los que van en el tacometro: su periodo debe
+     * ser corto comparados con el resto. */
+    CHECK(PROFILE_QV_POLL[0].period_ms <= 400);
+    CHECK(PROFILE_QV_POLL[1].period_ms <= 400);
+
+    /* Ningun PID por debajo de 250 ms: por debajo de eso la demanda se
+     * dispara y el enlace no da mas. */
+    for (int i = 0; i < PROFILE_QV_POLL_COUNT; i++) {
+        CHECK(PROFILE_QV_POLL[i].period_ms >= 250);
+    }
+    for (int i = 0; i < PROFILE_EXTRA_POLL_COUNT; i++) {
+        CHECK(PROFILE_EXTRA_POLL[i].period_ms >= 250);
+    }
+    for (int i = 0; i < PROFILE_MOTOR_POLL_COUNT; i++) {
+        CHECK(PROFILE_MOTOR_POLL[i].period_ms >= 1000);
+    }
 }
 
 int main(void)
@@ -30,6 +94,8 @@ int main(void)
     test_samples();
     test_discovery();
     test_profile();
+    test_link_budget();
+    test_smooth();
 
     if (g_failures != 0) {
         printf("%d comprobaciones fallidas\n", g_failures);
