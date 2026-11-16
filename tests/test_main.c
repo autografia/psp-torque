@@ -108,6 +108,33 @@ static void test_data_age(void)
     CHECK(obd_store_newest_ts(&st) == 1000u);
 }
 
+/* FASE F3: los periodos base son los de "el PID esta en pantalla". Fuera
+ * de pantalla se multiplican por 4 (tope 30 s) para no gastar ancho de
+ * banda en lo que no se mira. */
+static void test_profile_periods(void)
+{
+    /* El RPM es el dato que se mira en el tacometro: 200 ms (5 Hz). */
+    CHECK(obd_profile_base_period(0x0C) == 200);
+    CHECK(obd_profile_period(0x0C, 1) == 200);
+    CHECK(obd_profile_period(0x0C, 0) == 800);
+
+    /* MAP: 400 ms en pantalla, 1600 fuera. */
+    CHECK(obd_profile_base_period(0x0B) == 400);
+    CHECK(obd_profile_period(0x0B, 0) == 1600);
+
+    /* Tope de 30 s para los muy lentos. */
+    CHECK(obd_profile_period(0x33, 0) == 30000);
+
+    /* Los PID de diagnostico en pantalla son rapidos (1 s): compiten por
+     * el enlace solo cuando no se estan viendo. */
+    CHECK(obd_profile_base_period(0x06) == 1000);
+    CHECK(obd_profile_base_period(0x21) == 2000);
+
+    /* PID desconocido: 0. */
+    CHECK(obd_profile_base_period(0x77) == 0);
+    CHECK(!obd_profile_knows_pid(0x77));
+}
+
 int main(void)
 {
     test_parser();
@@ -117,6 +144,7 @@ int main(void)
     test_samples();
     test_discovery();
     test_profile();
+    test_profile_periods();
     test_data_age();
     test_link_budget();
     test_smooth();

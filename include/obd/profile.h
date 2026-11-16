@@ -27,6 +27,48 @@ typedef struct {
 extern const obd_poll_def PROFILE_QV_POLL[];
 extern const int PROFILE_QV_POLL_COUNT;
 
+/* FASE F3: periodo base de cada PID, en ms. Es el periodo que se usa
+ * cuando el PID esta en la pantalla activa; fuera de pantalla se
+ * multiplica por PROFILE_SLOW_FACTOR.
+ *
+ *  PID  base   que es
+ *  0x0C   200  RPM (5 Hz)
+ *  0x0B   400  MAP
+ *  0x0D   800  velocidad
+ *  0x11   800  mariposa
+ *  0x49   800  pedal (posicion D)
+ *  0x4A   800  pedal (posicion E)
+ *  0x04  1500  carga
+ *  0x05  3000  refrigerante
+ *  0x0F  3000  admision
+ *  0x06  1000  STFT
+ *  0x07  1000  LTFT
+ *  0x0E  1000  avance
+ *  0x14  1000  O2-1
+ *  0x15  1000  O2-2
+ *  0x21  2000  distancia con MIL
+ *  0x42  5000  voltaje
+ *  0x5C 10000  aceite
+ *  0x2F 10000  combustible
+ *  0x33 30000  baro
+ */
+
+/* Multiplicador del periodo cuando el PID no esta en pantalla. */
+#define PROFILE_SLOW_FACTOR 4
+
+/* Tope del periodo efectivo. */
+#define PROFILE_MAX_PERIOD_MS 30000u
+
+/* Periodo base de un PID, o 0 si no esta en la tabla. */
+uint16_t obd_profile_base_period(uint8_t pid);
+
+/* Periodo efectivo: el base si 'visible' es distinto de 0; si no, el
+ * base por PROFILE_SLOW_FACTOR, con tope en PROFILE_MAX_PERIOD_MS. */
+uint16_t obd_profile_period(uint8_t pid, int visible);
+
+/* 1 si el PID tiene periodo base conocido. */
+int obd_profile_knows_pid(uint8_t pid);
+
 /* PID del bloque 01 que se sondean siempre (mariposa y carga). */
 extern const obd_poll_def PROFILE_EXTRA_POLL[];
 extern const int PROFILE_EXTRA_POLL_COUNT;

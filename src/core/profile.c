@@ -2,6 +2,75 @@
 
 #include <stddef.h>
 
+/* FASE F3: periodo base de cada PID (el que usa cuando esta en la
+ * pantalla activa) y en que pantallas se muestra.
+ *
+ * La columna 'screens' dice en que pantallas el PID es visible:
+ * bit0 GENERAL, bit1 MOTOR, bit2 DIAG, bit3 TELEM.
+ *
+ * Fuera de pantalla el periodo se multiplica por PROFILE_SLOW_FACTOR: el
+ * ancho de banda del enlace (~12-13 peticiones/s) se reparte entre lo que
+ * se esta mirando, no a partes iguales entre los 17 PID. */
+static const struct {
+    uint8_t pid;
+    uint16_t period_ms;
+    uint8_t screens;
+} g_base_periods[] = {
+    { 0x0C, 200,   0x0F },  /* RPM: en todas */
+    { 0x0B, 400,   0x03 },  /* MAP: general y motor */
+    { 0x0D, 800,   0x0B },  /* velocidad: general, motor y telem */
+    { 0x11, 800,   0x07 },  /* mariposa: general, motor y telem */
+    { 0x49, 800,   0x03 },  /* pedal: general y motor */
+    { 0x4A, 800,   0x03 },  /* pedal (posicion E) */
+    { 0x04, 1500,  0x03 },  /* carga: general y motor */
+    { 0x05, 3000,  0x0F },  /* refrigerante: en todas */
+    { 0x0F, 3000,  0x0F },  /* admision: en todas */
+    { 0x06, 1000,  0x04 },  /* STFT: solo DIAG */
+    { 0x07, 1000,  0x04 },  /* LTFT: solo DIAG */
+    { 0x0E, 1000,  0x04 },  /* avance: solo DIAG */
+    { 0x14, 1000,  0x04 },  /* O2-1: solo DIAG */
+    { 0x15, 1000,  0x04 },  /* O2-2: solo DIAG */
+    { 0x21, 2000,  0x04 },  /* distancia con MIL: solo DIAG */
+    { 0x42, 5000,  0x0E },  /* voltaje: motor, DIAG y telem */
+    { 0x5C, 10000, 0x02 },  /* aceite: solo motor */
+    { 0x2F, 10000, 0x06 },  /* combustible: motor y DIAG */
+    { 0x33, 30000, 0x01 }   /* baro: solo general */
+};
+
+#define BASE_PERIOD_COUNT \
+    ((int)(sizeof(g_base_periods) / sizeof(g_base_periods[0])))
+
+uint16_t obd_profile_base_period(uint8_t pid)
+{
+    for (int i = 0; i < BASE_PERIOD_COUNT; i++) {
+        if (g_base_periods[i].pid == pid) {
+            return g_base_periods[i].period_ms;
+        }
+    }
+    return 0;
+}
+
+uint16_t obd_profile_period(uint8_t pid, int visible)
+{
+    uint16_t base = obd_profile_base_period(pid);
+    if (base == 0) {
+        return 0;
+    }
+    if (visible) {
+        return base;
+    }
+    uint32_t slow = (uint32_t)base * PROFILE_SLOW_FACTOR;
+    if (slow > PROFILE_MAX_PERIOD_MS) {
+        slow = PROFILE_MAX_PERIOD_MS;
+    }
+    return (uint16_t)slow;
+}
+
+int obd_profile_knows_pid(uint8_t pid)
+{
+    return obd_profile_base_period(pid) != 0;
+}
+
 /* FASE E2 + A: los periodos estan calibrados contra la capacidad real
  * del enlace ELM327 WiFi, no contra lo que el coche "deberia" dar.
  *
