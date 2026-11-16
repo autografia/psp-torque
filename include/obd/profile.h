@@ -69,6 +69,19 @@ uint16_t obd_profile_period(uint8_t pid, int visible);
 /* 1 si el PID tiene periodo base conocido. */
 int obd_profile_knows_pid(uint8_t pid);
 
+/* Mascara de pantallas en las que se muestra el PID: bit0 GENERAL,
+ * bit1 MOTOR, bit2 DIAG, bit3 TELEM. 0 si el PID no esta en la tabla. */
+uint8_t obd_profile_visible_mask(uint8_t pid);
+
+/* Demanda de peticiones (req/s) de una pantalla. La mascara usa los
+ * bits de pantalla de arriba; una mascara sin ninguno cuenta como el
+ * conjunto base (MODULOS, SNIFFER e INFO). */
+float obd_profile_demand(uint8_t screen_mask);
+
+/* Demanda si todos los PID se pidieran a la vez. Con el reparto por
+ * pantalla nunca ocurre, pero sirve de referencia. */
+float obd_profile_demand_all(void);
+
 /* PID del bloque 01 que se sondean siempre (mariposa y carga). */
 extern const obd_poll_def PROFILE_EXTRA_POLL[];
 extern const int PROFILE_EXTRA_POLL_COUNT;
@@ -88,15 +101,17 @@ extern const int PROFILE_MOTOR_POLL_COUNT;
 /* FASE E2 + A: presupuesto de peticiones del enlace.
  *
  * Medido sobre un clon ELM327 v1.5 por WiFi: una peticion completa
- * (envio + respuesta del coche + hueco entre peticiones) ronda los
- * 55-83 ms segun cuanto hueco quede entre comandos. El suelo medido
- * es de ~12 peticiones/s y, con el hueco eliminado (FASE C), ~18.
+ * (envio + respuesta del coche + hueco entre comandos) tardaba 83 ms
+ * con el hueco de 24 ms que dejaba la version anterior, es decir
+ * ~12 peticiones/s. Con el hueco minimo de 8 ms (FASE F1) el ciclo
+ * baja a ~60-67 ms y la capacidad sube a ~15 peticiones/s.
  *
- * El presupuesto es 13 req/s: la cifra CONSERVADORA (la que se sostiene
- * aunque el ELM327 no tolere comandos seguidos) mas un pequeño margen.
- * La demanda en el caso peor queda en 12,05 req/s y en un coche normal
- * alrededor de 11. */
-#define PROFILE_LINK_BUDGET_REQ_S 13.0f
+ * El presupuesto es 14 req/s: una cifra conservadora para la
+ * configuracion objetivo, que el viaje de calibracion confirmara. La
+ * demanda de cada pantalla tiene que caber dentro (test
+ * `test_demand_by_screen`); la suma de "todo a la vez" no, porque con
+ * el reparto por pantalla nunca se pide todo a la vez. */
+#define PROFILE_LINK_BUDGET_REQ_S 14.0f
 
 extern const obd_poll_def PROFILE_ENGINE_POLL[];
 extern const int PROFILE_ENGINE_POLL_COUNT;
