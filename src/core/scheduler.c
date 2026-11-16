@@ -72,6 +72,18 @@ void obd_sched_begin(obd_scheduler *sched, int idx, uint32_t now_ms)
     }
 }
 
+void obd_sched_set_period(obd_scheduler *sched, int idx, uint16_t period_ms,
+                          int due_now)
+{
+    if (idx < 0 || idx >= sched->count) {
+        return;
+    }
+    sched->items[idx].period_ms = (period_ms > 0) ? period_ms : 100;
+    if (due_now) {
+        sched->items[idx].next_due_ms = 0;
+    }
+}
+
 void obd_sched_end(obd_scheduler *sched, int idx, uint32_t now_ms,
                    int got_data)
 {

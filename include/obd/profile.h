@@ -27,6 +27,62 @@ typedef struct {
 extern const obd_poll_def PROFILE_QV_POLL[];
 extern const int PROFILE_QV_POLL_COUNT;
 
+/* FASE F3: periodo base de cada PID, en ms. Es el periodo que se usa
+ * cuando el PID esta en la pantalla activa; fuera de pantalla se
+ * multiplica por PROFILE_SLOW_FACTOR.
+ *
+ *  PID  base   que es
+ *  0x0C   200  RPM (5 Hz)
+ *  0x0B   400  MAP
+ *  0x0D   800  velocidad
+ *  0x11   800  mariposa
+ *  0x49   800  pedal (posicion D)
+ *  0x4A   800  pedal (posicion E)
+ *  0x5A  1000  pedal (posicion relativa)
+ *  0x04  1500  carga
+ *  0x05  3000  refrigerante
+ *  0x0F  3000  admision
+ *  0x06  1000  STFT
+ *  0x07  1000  LTFT
+ *  0x0E  1000  avance
+ *  0x14  1000  O2-1
+ *  0x15  1000  O2-2
+ *  0x21  2000  distancia con MIL
+ *  0x42  5000  voltaje
+ *  0x5C 10000  aceite
+ *  0x2F 10000  combustible
+ *  0x33 30000  baro
+ */
+
+/* Multiplicador del periodo cuando el PID no esta en pantalla. */
+#define PROFILE_SLOW_FACTOR 4
+
+/* Tope del periodo efectivo. */
+#define PROFILE_MAX_PERIOD_MS 30000u
+
+/* Periodo base de un PID, o 0 si no esta en la tabla. */
+uint16_t obd_profile_base_period(uint8_t pid);
+
+/* Periodo efectivo: el base si 'visible' es distinto de 0; si no, el
+ * base por PROFILE_SLOW_FACTOR, con tope en PROFILE_MAX_PERIOD_MS. */
+uint16_t obd_profile_period(uint8_t pid, int visible);
+
+/* 1 si el PID tiene periodo base conocido. */
+int obd_profile_knows_pid(uint8_t pid);
+
+/* Mascara de pantallas en las que se muestra el PID: bit0 GENERAL,
+ * bit1 MOTOR, bit2 DIAG, bit3 TELEM. 0 si el PID no esta en la tabla. */
+uint8_t obd_profile_visible_mask(uint8_t pid);
+
+/* Demanda de peticiones (req/s) de una pantalla. La mascara usa los
+ * bits de pantalla de arriba; una mascara sin ninguno cuenta como el
+ * conjunto base (MODULOS, SNIFFER e INFO). */
+float obd_profile_demand(uint8_t screen_mask);
+
+/* Demanda si todos los PID se pidieran a la vez. Con el reparto por
+ * pantalla nunca ocurre, pero sirve de referencia. */
+float obd_profile_demand_all(void);
+
 /* PID del bloque 01 que se sondean siempre (mariposa y carga). */
 extern const obd_poll_def PROFILE_EXTRA_POLL[];
 extern const int PROFILE_EXTRA_POLL_COUNT;
@@ -46,17 +102,33 @@ extern const int PROFILE_MOTOR_POLL_COUNT;
 /* FASE E2 + A: presupuesto de peticiones del enlace.
  *
  * Medido sobre un clon ELM327 v1.5 por WiFi: una peticion completa
- * (envio + respuesta del coche + hueco entre peticiones) ronda los
- * 55-83 ms segun cuanto hueco quede entre comandos. El suelo medido
- * es de ~12 peticiones/s y, con el hueco eliminado (FASE C), ~18.
+ * (envio + respuesta del coche + hueco entre comandos) tardaba 83 ms
+ * con el hueco de 24 ms que dejaba la version anterior, es decir
+ * ~12 peticiones/s. Con el hueco minimo de 8 ms (FASE F1) el ciclo
+ * baja a ~60-67 ms y la capacidad sube a ~15 peticiones/s.
  *
- * El presupuesto es 13 req/s: la cifra CONSERVADORA (la que se sostiene
- * aunque el ELM327 no tolere comandos seguidos) mas un pequeño margen.
- * La demanda en el caso peor queda en 12,05 req/s y en un coche normal
- * alrededor de 11. */
-#define PROFILE_LINK_BUDGET_REQ_S 13.0f
+ * El presupuesto es 14 req/s: una cifra conservadora para la
+ * configuracion objetivo, que el viaje de calibracion confirmara. La
+ * demanda de cada pantalla tiene que caber dentro (test
+ * `test_demand_by_screen`); la suma de "todo a la vez" no, porque con
+ * el reparto por pantalla nunca se pide todo a la vez. */
+#define PROFILE_LINK_BUDGET_REQ_S 14.0f
 
 extern const obd_poll_def PROFILE_ENGINE_POLL[];
 extern const int PROFILE_ENGINE_POLL_COUNT;
+
+/* FASE F3: conjunto de PIDs que se fuerzan al periodo base porque
+ * estan a la vista en un hueco configurable o en una serie de
+ * telemetria. Se guarda como array de bytes, no como mascara de bits:
+ * PIDs como 0x5C (92) o 0x49 (73) no caben en un desplazamiento de 64
+ * bits y `1u << pid` seria comportamiento indefinido. */
+#define OBD_PID_MAX 0x7Fu
+
+typedef struct {
+    uint8_t pids[OBD_PID_MAX + 1];
+} obd_forced_set;
+
+void obd_forced_set_add(obd_forced_set *set, uint8_t pid);
+int obd_forced_set_has(const obd_forced_set *set, uint8_t pid);
 
 #endif

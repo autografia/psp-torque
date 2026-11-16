@@ -118,3 +118,53 @@ void test_scheduler(void)
     }
     CHECK(obd_sched_add(&full, 0x0C, 100, 0) == -1);
 }
+
+/* FASE F3: cambiar el periodo de un PID en caliente, para repartir el
+ * ancho de banda segun la pantalla activa. */
+void test_set_period(void)
+{
+    obd_scheduler s;
+    obd_sched_init(&s);
+    obd_sched_add(&s, 0x0C, 200, 0);
+
+    /* Un PID recien anadido ya esta pendiente. */
+    CHECK(obd_sched_next(&s, 0u) == 0);
+
+    obd_sched_begin(&s, 0, 100u);
+    obd_sched_end(&s, 0, 100u, 1);       /* next_due = 100 + 200 = 300 */
+    CHECK(s.items[0].next_due_ms == 300);
+
+    /* El periodo nuevo se aplica al siguiente ciclo; el pendiente
+     * actual no se toca (no se cancela una peticion ya vencida). */
+    obd_sched_set_period(&s, 0, 800, 0);
+    CHECK(s.items[0].period_ms == 800);
+    CHECK(obd_sched_next(&s, 300u) == 0);   /* sigue pendiente (vencia en 300) */
+
+    obd_sched_begin(&s, 0, 300u);
+    obd_sched_end(&s, 0, 300u, 1);          /* next_due = 300 + 800 = 1100 */
+    CHECK(obd_sched_next(&s, 500u) < 0);    /* ya no toca hasta 1100 */
+    CHECK(obd_sched_next(&s, 1100u) == 0);
+
+    /* Con due_now el PID pasa a estar pendiente de inmediato: es lo
+     * que hace que un dato que acaba de aparecer se pida al instante. */
+    obd_sched_set_period(&s, 0, 800, 1);
+    CHECK(obd_sched_next(&s, 500u) == 0);
+
+    /* Reprogramar con una peticion EN VUELO no deja el planificador
+     * colgado: cuando la peticion en vuelo termina, sigue sirviendo. */
+    obd_sched_begin(&s, 0, 1000u);
+    obd_sched_set_period(&s, 0, 300, 1);
+    CHECK(obd_sched_next(&s, 1000u) < 0);   /* hay una en vuelo */
+    obd_sched_end(&s, 0, 1000u, 1);        /* next_due = 1300 */
+    CHECK(obd_sched_next(&s, 1000u) < 0);   /* todavia no vence */
+    CHECK(obd_sched_next(&s, 1300u) == 0);  /* sigue sirviendo */
+
+    /* Un periodo de 0 no vale: se usa el minimo. */
+    obd_sched_set_period(&s, 0, 0, 0);
+    CHECK(s.items[0].period_ms == 100);
+
+    /* Un indice fuera de rango no hace nada. */
+    obd_sched_set_period(&s, 99, 500, 1);
+    obd_sched_set_period(&s, -1, 500, 1);
+    CHECK(s.items[0].period_ms == 100);
+}

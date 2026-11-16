@@ -57,6 +57,21 @@ const obd_sample *obd_store_get(const obd_sample_store *store, uint8_t pid)
     return 0;
 }
 
+uint32_t obd_store_newest_ts(const obd_sample_store *store)
+{
+    uint32_t newest = 0u;
+    for (int i = 0; i < store->count; i++) {
+        const obd_sample *s = &store->items[i];
+        if (!s->valid) {
+            continue;
+        }
+        if (newest == 0u || s->ts_ms > newest) {
+            newest = s->ts_ms;
+        }
+    }
+    return newest;
+}
+
 int obd_sample_stale(const obd_sample *sample, uint32_t now_ms,
                      uint32_t max_age_ms)
 {

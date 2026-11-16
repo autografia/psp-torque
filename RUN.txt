@@ -97,6 +97,9 @@ AJUSTES DE TEMA
     CONTRASTE   BAJO, NORMAL o ALTO
     ANIMACION   SI o NO (animacion del trebol al arrancar)
     MUESTREO    COMPLETO o RAPIDO (rapido: menos PID, mas fluidez)
+    HUECO ELM   hueco minimo entre comandos al adaptador (0-17 ms).
+                8 ms es el valor recomendado; con 0 el ELM327 retrasa
+                la respuesta y baja el caudal de datos.
     EDITAR VISTA abre el editor del panel: cada hueco se puede poner
                 en RELOJ, BARRA, TEXTO u OCULTO y cambiar de dato.
     PICO MAX    SI o NO (retiene el maximo de RPM/boost/velocidad)

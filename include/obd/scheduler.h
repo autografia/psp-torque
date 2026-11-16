@@ -31,6 +31,13 @@ int obd_sched_next(obd_scheduler *sched, uint32_t now_ms);
 /* Marca el PID como enviado. */
 void obd_sched_begin(obd_scheduler *sched, int idx, uint32_t now_ms);
 
+/* FASE F3: cambia el periodo de un PID en caliente (reparto por
+ * pantalla). Con 'due_now' distinto de cero el PID pasa a estar
+ * pendiente de inmediato: es lo que hace que un dato que acaba de
+ * aparecer en pantalla se pida al instante. */
+void obd_sched_set_period(obd_scheduler *sched, int idx, uint16_t period_ms,
+                          int due_now);
+
 /* Cierra la peticion: reprograma y cuenta NO DATA. */
 void obd_sched_end(obd_scheduler *sched, int idx, uint32_t now_ms,
                    int got_data);

@@ -229,6 +229,46 @@ El filtro del núcleo (`obd_smooth`) usa constante de tiempo fija
 (`tau = 150 ms`): `alpha = 1 - exp(-dt/tau)`. El retardo es siempre `tau`,
 venga la cadencia como venga.
 
+### 5.6 Reparto del ancho de banda por pantalla (FASE F3)
+
+El enlace da ~12-14 peticiones/s, el planificador tiene 19 PID y **no todos
+se están mirando a la vez**. Los periodos base (tabla `g_base_periods` en
+`src/core/profile.c`) son los que se usan cuando el PID está en la pantalla
+activa; fuera de ella se multiplican por 4 con tope de 30 s.
+
+| PID | base en pantalla | fuera de pantalla |
+|---|---|---|
+| 0x0C RPM | 200 ms (5 Hz) | 800 ms |
+| 0x0B MAP | 500 ms | 2000 ms |
+| 0x0D / 0x11 / 0x49 | 800-1000 ms | ×4 |
+| 0x05 / 0x0F temperatura | 3000 ms | ×4 |
+| 0x06 / 0x07 / 0x0E / 0x14 / 0x15 | 1500 ms | 6000 ms |
+| 0x21 distancia MIL | 2000 ms | 8000 ms |
+| 0x42 / 0x5C / 0x2F / 0x33 | 5-30 s | tope 30 s |
+
+`apply_screen_schedule()` (capa PSP) recalcula los periodos al cambiar de
+pantalla y deja pendientes de inmediato los PID que acaban de aparecer.
+Los huecos del GENERAL y las series de TELEMETRIA son configurables:
+cualquier PID puede acabar en pantalla, así que se fuerza su periodo base
+con un conjunto de bytes (`obd_forced_set`) que cubre todo el rango de
+OBD-II: una máscara de 64 bits daría comportamiento indefinido con PIDs
+como 0x5C (92).
+
+Demanda por pantalla: GENERAL 13,53 · MOTOR 13,81 · DIAG 12,30 · TELEM
+9,55 req/s, todas por debajo del presupuesto de 14.
+
+### 5.7 Hueco mínimo entre comandos (FASE F1)
+
+Medido sobre el clon ELM327 v1.5: si el siguiente comando llega apenas
+termina la respuesta (hueco 0), el adaptador retrasa su respuesta un tick de
+16,7 ms (el prompt pasa de 50 a 66,7 ms) y la capacidad cae de ~12 a 9,25
+peticiones/s. **El hueco no es tiempo perdido: es un requisito del
+adaptador.**
+
+El ajuste `HUECO ELM` del menú (0/2/4/6/8/12/17 ms, defecto 8) permite
+calibrar el umbral real de cada adaptador. El log registra `gap=` (hueco
+medido) y `gapcfg=` (configurado) para que un solo viaje dé la curva.
+
 ## 6. Modelo de muestra
 
 ```c
