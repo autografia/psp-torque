@@ -1,4 +1,5 @@
 #include "obd/profile.h"
+#include "obd/samples.h"
 #include "test_util.h"
 
 #include <stdio.h>
@@ -85,6 +86,28 @@ static void test_link_budget(void)
     }
 }
 
+/* La edad global del panel es la de la muestra mas reciente de
+ * CUALQUIER PID: si el RPM se retrasa pero el resto fluye, el panel
+ * esta vivo y no debe avisar de datos viejos. */
+static void test_data_age(void)
+{
+    obd_sample_store st;
+    obd_store_init(&st);
+
+    /* Sin muestras: edad desconocida. */
+    CHECK(obd_store_newest_ts(&st) == 0u);
+
+    obd_store_set(&st, 0x0C, 1000.0f, OBD_UNIT_RPM, 1000u, OBD_SRC_REAL);
+    obd_store_set(&st, 0x0B, 30.0f, OBD_UNIT_KPA, 1500u, OBD_SRC_REAL);
+
+    /* La mas reciente manda, no la del RPM. */
+    CHECK(obd_store_newest_ts(&st) == 1500u);
+
+    /* Una muestra invalidada no cuenta. */
+    obd_store_invalidate(&st, 0x0B, 1600u);
+    CHECK(obd_store_newest_ts(&st) == 1000u);
+}
+
 int main(void)
 {
     test_parser();
@@ -94,6 +117,7 @@ int main(void)
     test_samples();
     test_discovery();
     test_profile();
+    test_data_age();
     test_link_budget();
     test_smooth();
 

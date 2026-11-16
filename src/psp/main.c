@@ -3457,14 +3457,11 @@ static uint32_t data_age_ms(uint32_t now)
     if (g_demo) {
         return 0;
     }
-    const obd_sample *s = obd_store_get(&g_store, 0x0C);
-    if (s == NULL || !s->valid) {
-        s = obd_store_get(&g_store, 0x0B);
-    }
-    if (s == NULL || !s->valid) {
+    uint32_t ts = obd_store_newest_ts(&g_store);
+    if (ts == 0u) {
         return 0xFFFFFFFFu;
     }
-    return (uint32_t)(now - s->ts_ms);
+    return (uint32_t)(now - ts);
 }
 
 /* FASE F2: umbrales de la edad del dato.

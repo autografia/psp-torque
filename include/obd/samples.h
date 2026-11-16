@@ -37,6 +37,11 @@ void obd_store_invalidate(obd_sample_store *store, uint8_t pid,
 
 const obd_sample *obd_store_get(const obd_sample_store *store, uint8_t pid);
 
+/* Marca de tiempo de la muestra valida mas reciente del almacen, o 0 si
+ * no hay ninguna. Es la base de la "edad del dato" global del panel: si
+ * llega cualquier PID, el enlace esta vivo. */
+uint32_t obd_store_newest_ts(const obd_sample_store *store);
+
 int obd_sample_stale(const obd_sample *sample, uint32_t now_ms,
                      uint32_t max_age_ms);
 
