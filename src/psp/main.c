@@ -60,7 +60,7 @@ PSP_HEAP_SIZE_KB(4096);
 #define DEFAULT_HOST "192.168.0.10"
 #define DEFAULT_PORT 35000
 #define MAX_TARGETS 4
-#define BUILD_TAG "fase2.41 2026-11-15 FASE C+A envio inmediato y cadencia rebalanceada: RPM a 4 Hz"
+#define BUILD_TAG "fase2.42 2026-11-16 FASE F2 transparencia: edad del dato, atenuacion y estado real del adaptador"
 #define CMD_TIMEOUT_MS 500
 /* Si el adaptador ha demostrado que envia el prompt '>', hay que esperarlo
  * antes de mandar el siguiente comando. El ELM327 hace tareas internas
@@ -150,6 +150,17 @@ static obd_smooth g_ema_thr;
 static int g_mode = MODE_QV;
 static unsigned int g_prev_buttons = 0;
 static int g_link_connected = 0;
+
+/* FASE F2: respuestas STOPPED seguidas del adaptador.
+ *
+ * El ELM327 puede quedarse atascado en STOPPED y no sale de ahi: en un
+ * viaje real se vio 99+ respuestas seguidas igual. Como STOPPED no marca
+ * "error" en el parser, antes la app martilleaba al adaptador sin
+ * llegar nunca a la reconexion. */
+#define ELM_STUCK_MIN 3      /* para mostrar "ELM ATASCADO" */
+#define ELM_STUCK_RECOVER 8  /* para escalar a reconexion */
+
+static int g_elm_stuck = 0;
 
 /* SELECT durante una conexion en curso la cancela (FASE D3). */
 static int g_connect_cancel = 0;
@@ -437,6 +448,8 @@ static const char *tr(const char *key)
         { "TURBO AUTO", "TURBO AUTO" },
         { "BOOST MAX", "BOOST MAX" },
         { "IDIOMA", "LANGUAGE" },
+        { "ELM ATASCADO", "ELM STUCK" },
+        { "DATOS VIEJOS", "OLD DATA" },
         { "GENERAL", "GENERAL" },
         { "MOTOR", "ENGINE" },
         { "DIAG", "DIAG" },
@@ -2319,6 +2332,7 @@ static int connect_network_and_elm(Target *targets, int *target_count,
     g_net_ui_last = 0;
     g_link_connected = 0;
     g_connect_cancel = 0;
+    g_elm_stuck = 0;
 
     obd_store_init(&g_store);
     boost_init(&g_boost, PROFILE_BARO_FALLBACK_KPA);
@@ -3435,7 +3449,10 @@ static void fmt_signed_2(char *buf, size_t size, float value)
              scaled / 100, scaled % 100);
 }
 
-static int data_is_stale(uint32_t now)
+/* FASE F2: edad del ultimo dato utilizable, en ms.
+ *
+ * Devuelve 0xFFFFFFFF si no hay ninguna muestra valida todavia. */
+static uint32_t data_age_ms(uint32_t now)
 {
     if (g_demo) {
         return 0;
@@ -3445,9 +3462,26 @@ static int data_is_stale(uint32_t now)
         s = obd_store_get(&g_store, 0x0B);
     }
     if (s == NULL || !s->valid) {
-        return 1;
+        return 0xFFFFFFFFu;
     }
-    return (uint32_t)(now - s->ts_ms) > 3000u;
+    return (uint32_t)(now - s->ts_ms);
+}
+
+/* FASE F2: umbrales de la edad del dato.
+ *
+ * OLD: a partir de aqui el contenido se atenua y la cabecera dice
+ *      "DATOS VIEJOS". Con el RPM a ~330 ms son tres periodos, asi que
+ *      no parpadea con un timeout puntual.
+ * DEAD: a partir de aqui el dato ya no sirve y se muestra "SIN DATOS". */
+#define DATA_OLD_MS  1000u
+#define DATA_DEAD_MS 3000u
+
+static int data_is_stale(uint32_t now)
+{
+    if (g_demo) {
+        return 0;
+    }
+    return data_age_ms(now) > DATA_DEAD_MS;
 }
 
 /* Historial por canal: cada elemento declara su PID de origen. Los
@@ -4203,8 +4237,13 @@ static void qv_tile(float x, float y, float w, float h,
     }
 }
 
-static void draw_top_bar(int connected, int stale)
+static void draw_top_bar(int connected, int stale, uint32_t age_ms)
 {
+    /* La cabecera no se atenua: es donde vive el aviso de que el dato
+     * esta viejo, asi que tiene que seguir leyendose siempre. */
+    int saved_dim = g_gfx_dim;
+    g_gfx_dim = 100;
+
     gfx_rect(0, 0, GFX_W, 25, QV_PANEL);
     gfx_rect(0, 25, GFX_W, 1,
              theme_is_game() ? theme_accent() : QV_RED);
@@ -4238,9 +4277,22 @@ static void draw_top_bar(int connected, int stale)
         state = "CONECT";
         state_color = QV_AMBER;
     } else if (connected) {
-        if (stale) {
+        if (g_elm_stuck >= ELM_STUCK_MIN) {
+            /* FASE F2: el adaptador contesta pero se queda atascado en
+             * STOPPED. No es lo mismo que no tener datos: el enlace
+             * esta vivo y el ELM327 no responde. */
+            dot = QV_CRIT;
+            state = tr("ELM ATASCADO");
+            state_color = QV_CRIT;
+        } else if (stale) {
             dot = QV_AMBER;
-            state = "SIN DATOS";
+            state = tr("SIN DATOS");
+            state_color = QV_AMBER;
+        } else if (age_ms >= DATA_OLD_MS) {
+            /* FASE F2: el dato envejece. Se avisa en vez de dejar el
+             * panel congelado sin explicacion. */
+            dot = QV_AMBER;
+            state = tr("DATOS VIEJOS");
             state_color = QV_AMBER;
         } else {
             dot = QV_OK;
@@ -4267,6 +4319,8 @@ static void draw_top_bar(int connected, int stale)
     int right_x = GFX_W - 8 - gfx_text_width(righttop, 1);
     gfx_circle((float)(right_x - 9), 12.0f, 4.0f, dot);
     gfx_text(right_x, 8, righttop, state_color, 1);
+
+    g_gfx_dim = saved_dim;
 }
 
 static void draw_tacho(const dash_data *d, float x, float y, float w, float h)
@@ -5779,6 +5833,11 @@ static void draw_net_banner(void)
     gfx_rect(x, y, w, h, QV_PANEL2);
     gfx_border(x, y, w, h, 2.0f, QV_RED);
 
+    /* FASE F2: el aviso de red no se atenua nunca: es justo el
+     * momento en que el usuario necesita leerlo. */
+    int saved_dim = g_gfx_dim;
+    g_gfx_dim = 100;
+
     gfx_text_center(GFX_W / 2, (int)y + 14, g_net_msg, QV_TEXT, 1);
 
     /* Puntos animados mientras se espera a la red. */
@@ -5789,6 +5848,8 @@ static void draw_net_banner(void)
     }
     dots[ndots] = '\0';
     gfx_text_center(GFX_W / 2, (int)y + 36, dots, QV_AMBER, 2);
+
+    g_gfx_dim = saved_dim;
 }
 
 static void run_sniff(int sock)
@@ -6710,10 +6771,19 @@ static void draw_screen(uint32_t now, int requests, int data_count,
     }
 
     int stale = data_is_stale(now);
+    uint32_t age_ms = data_age_ms(now);
+
+    /* FASE F2: si el dato envejece, el contenido se apaga (el marco se
+     * queda). El panel deja de parecer congelado y empieza a explicar
+     * que lo que hay dentro ya no es de ahora. */
+    g_gfx_dim = (age_ms >= DATA_OLD_MS) ? 55 : 100;
+
     theme_effects_update(now);
 
-    /* Menu abierto: se pinta solo el menu, sin dashboard ni calculos. */
+    /* Menu abierto: se pinta solo el menu, sin dashboard ni calculos.
+     * El menu nunca se atenua: es una pantalla de control, no datos. */
     if (menu_only) {
+        g_gfx_dim = 100;
         gfx_frame_begin();
         if (g_settings_open && !g_edit_open) {
             draw_settings_overlay();
@@ -6748,7 +6818,7 @@ static void draw_screen(uint32_t now, int requests, int data_count,
 
     gfx_frame_begin();
 
-    draw_top_bar(g_link_connected, stale);
+    draw_top_bar(g_link_connected, stale, age_ms);
 
     if (g_mode == MODE_QV) {
         draw_qv(&d);
@@ -7348,6 +7418,7 @@ static void run_dashboard(Target *targets, int target_count)
                 last_rtt = -1;
                 consecutive_timeouts = 0;
                 consecutive_errors = 0;
+                g_elm_stuck = 0;
                 g_hist_count = 0;
                 g_hist_pos = 0;
                 g_hist_last = 0;
@@ -7450,6 +7521,14 @@ static void run_dashboard(Target *targets, int target_count)
                 consecutive_errors = 0;
             }
 
+            /* FASE F2: contador de STOPPED seguidos. El ELM327 se puede
+             * quedar pegado en ese estado y no sale ni con reintentos. */
+            if (reply->stopped) {
+                g_elm_stuck++;
+            } else {
+                g_elm_stuck = 0;
+            }
+
             obd_sched_end(&g_sched, rx_idx, t1,
                           (reply->no_data || reply->unable) ? 0 : 1);
 
@@ -7471,11 +7550,24 @@ static void run_dashboard(Target *targets, int target_count)
                 }
             }
 
+            /* FASE F2: el adaptador atascado en STOPPED no se
+             * recupera solo. Se escala al camino de reconexion (que
+             * rehace el handshake y deja el ELM327 como nuevo) en vez
+             * de seguir mandando comandos a un adaptador muerto. */
+            if (g_elm_stuck >= ELM_STUCK_RECOVER) {
+                link_bad = 1;
+            }
+
             if (link_bad) {
-                    log_file_printf("Enlace perdido: %s\n",
-                                    reply->bytes == 0
-                                        ? "8 timeouts"
-                                        : "40 errores de bus");
+                    if (g_elm_stuck >= ELM_STUCK_RECOVER) {
+                        log_file_printf("Enlace perdido: adaptador atascado "
+                                        "en STOPPED (%d)\n", g_elm_stuck);
+                    } else {
+                        log_file_printf("Enlace perdido: %s\n",
+                                        reply->bytes == 0
+                                            ? "8 timeouts"
+                                            : "40 errores de bus");
+                    }
                     log_sync();
                     sceNetInetClose(sock);
                     sock = -1;
@@ -7484,6 +7576,7 @@ static void run_dashboard(Target *targets, int target_count)
                     link_losses++;
                     consecutive_timeouts = 0;
                     consecutive_errors = 0;
+                    g_elm_stuck = 0;
 
                     /* D3: en lugar de bloquear 2 s y reconectar en el
                      * sitio (congelaba la GUI y dejaba el socket en un
@@ -7538,7 +7631,11 @@ static void run_dashboard(Target *targets, int target_count)
                 log_file_printf("Auto-reintento %d/%d...\n",
                                 reconn_tries, RECONN_MAX_TRIES);
                 log_sync();
-                net_ui_set("REINTENTANDO");
+                /* FASE F2: el cartel dice en que intento estamos. */
+                char msg[32];
+                snprintf(msg, sizeof(msg), "REINTENTANDO %d/%d",
+                         reconn_tries, RECONN_MAX_TRIES);
+                net_ui_set(msg);
                 sock = connect_network_and_elm(targets, &target_count, 0);
                 now = now_ms();
                 if (sock >= 0) {
@@ -7546,6 +7643,7 @@ static void run_dashboard(Target *targets, int target_count)
                     reconnects++;
                     consecutive_timeouts = 0;
                     consecutive_errors = 0;
+                    g_elm_stuck = 0;
                     last_rtt = -1;
                     g_hist_count = 0;
                     g_hist_pos = 0;

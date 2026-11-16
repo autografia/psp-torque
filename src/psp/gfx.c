@@ -184,6 +184,17 @@ uint32_t gfx_shade(uint32_t c, int percent)
     return GFX_RGBA(r, g, b, (int)((c >> 24) & 0xFF));
 }
 
+/* FASE F2: atenuacion global del contenido. */
+int g_gfx_dim = 100;
+
+uint32_t gfx_dimmed(uint32_t c)
+{
+    if (g_gfx_dim >= 100) {
+        return c;
+    }
+    return gfx_shade(c, g_gfx_dim);
+}
+
 static uint32_t shade_color(uint32_t c, int percent)
 {
     return gfx_shade(c, percent);

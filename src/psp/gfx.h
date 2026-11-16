@@ -50,18 +50,29 @@ void gfx_theme_apply(int preset, int contrast);
 const char *gfx_theme_name(int preset);
 extern gfx_theme g_active_theme;
 
+/* FASE F2: atenuacion del contenido cuando el dato envejece.
+ *
+ * 100 = normal. Por debajo, el contenido (textos, agujas, arcos) se
+ * apaga mientras el marco (fondo, paneles) se mantiene: asi el panel
+ * sigue leyendose pero se ve claramente que lo que hay dentro esta
+ * viejo. */
+extern int g_gfx_dim;
+
+/* Aplica el factor de atenuacion a un color. */
+uint32_t gfx_dimmed(uint32_t c);
+
 #define QV_BG       (g_active_theme.bg)
 #define QV_PANEL    (g_active_theme.panel)
 #define QV_PANEL2   (g_active_theme.panel2)
 #define QV_TRACK    (g_active_theme.track)
-#define QV_TEXT     (g_active_theme.text)
-#define QV_DIM      (g_active_theme.dim)
-#define QV_RED      (g_active_theme.red)
-#define QV_GREEN    (g_active_theme.green)
-#define QV_AMBER    (g_active_theme.amber)
-#define QV_CRIT     (g_active_theme.crit)
-#define QV_OK       (g_active_theme.ok)
-#define QV_CYAN     (g_active_theme.cyan)
+#define QV_TEXT     (gfx_dimmed(g_active_theme.text))
+#define QV_DIM      (gfx_dimmed(g_active_theme.dim))
+#define QV_RED      (gfx_dimmed(g_active_theme.red))
+#define QV_GREEN    (gfx_dimmed(g_active_theme.green))
+#define QV_AMBER    (gfx_dimmed(g_active_theme.amber))
+#define QV_CRIT     (gfx_dimmed(g_active_theme.crit))
+#define QV_OK       (gfx_dimmed(g_active_theme.ok))
+#define QV_CYAN     (gfx_dimmed(g_active_theme.cyan))
 
 int gfx_init(void);
 void gfx_shutdown(void);
