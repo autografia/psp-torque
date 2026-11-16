@@ -117,4 +117,18 @@ extern const int PROFILE_MOTOR_POLL_COUNT;
 extern const obd_poll_def PROFILE_ENGINE_POLL[];
 extern const int PROFILE_ENGINE_POLL_COUNT;
 
+/* FASE F3: conjunto de PIDs que se fuerzan al periodo base porque
+ * estan a la vista en un hueco configurable o en una serie de
+ * telemetria. Se guarda como array de bytes, no como mascara de bits:
+ * PIDs como 0x5C (92) o 0x49 (73) no caben en un desplazamiento de 64
+ * bits y `1u << pid` seria comportamiento indefinido. */
+#define OBD_PID_MAX 0x7Fu
+
+typedef struct {
+    uint8_t pids[OBD_PID_MAX + 1];
+} obd_forced_set;
+
+void obd_forced_set_add(obd_forced_set *set, uint8_t pid);
+int obd_forced_set_has(const obd_forced_set *set, uint8_t pid);
+
 #endif

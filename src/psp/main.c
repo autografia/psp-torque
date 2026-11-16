@@ -2295,8 +2295,7 @@ static uint8_t widget_pid(int item)
  *
  * Los huecos del GENERAL y las series de TELEMETRIA son configurables,
  * asi que cualquier PID puede acabar en pantalla: se fuerza su periodo
- * base con la mascara de bits. La mascara es de 64 bits porque el PID
- * mas alto (0x33 = 51) no cabe en un desplazamiento de 32. */
+ * base con un conjunto de bytes que cubre todo el rango de OBD-II. */
 static void apply_screen_schedule(uint32_t now)
 {
     uint8_t mode_mask;
@@ -2316,19 +2315,23 @@ static void apply_screen_schedule(uint32_t now)
         break;
     }
 
-    uint64_t forced = 0;
+    /* Conjunto de PIDs forzados a pantalla. Es un array de bytes, no
+     * una mascara: PIDs como 0x5C (92) no caben en 64 bits y
+     * `1u << pid` seria comportamiento indefinido. */
+    obd_forced_set forced;
+    memset(&forced, 0, sizeof(forced));
     if (g_mode == MODE_QV) {
         for (int i = 0; i < DASH_SLOTS; i++) {
             uint8_t pid = widget_pid(g_slot_item[i]);
             if (pid != 0) {
-                forced |= (uint64_t)1u << pid;
+                obd_forced_set_add(&forced, pid);
             }
         }
     } else if (g_mode == MODE_TELEMETRY) {
         for (int i = 0; i < TEL_SLOTS; i++) {
             uint8_t pid = widget_pid(g_tel_item[i]);
             if (pid != 0) {
-                forced |= (uint64_t)1u << pid;
+                obd_forced_set_add(&forced, pid);
             }
         }
     }
@@ -2337,10 +2340,11 @@ static void apply_screen_schedule(uint32_t now)
         uint8_t pid = g_sched.items[i].pid;
         uint8_t mask = obd_profile_visible_mask(pid);
         int visible = (mask & mode_mask) != 0 ||
-                      (forced & ((uint64_t)1u << pid)) != 0;
+                      obd_forced_set_has(&forced, pid);
         uint16_t period = obd_profile_period(pid, visible);
         if (period == 0) {
-            period = 100;   /* PID sin entrada en la tabla (p. ej. 0x5A) */
+            /* PID sin entrada en la tabla: periodo lento, nunca 10 Hz. */
+            period = 10000;
         }
         int was_due = (int32_t)(now - g_sched.items[i].next_due_ms) >= 0;
         obd_sched_set_period(&g_sched, i, period,
@@ -7289,6 +7293,10 @@ static int handle_edit_input(unsigned int pressed)
     }
 
     if (changed) {
+        /* FASE F3: al cambiar un hueco, el PID que acaba de aparecer
+         * tiene que pedirse de inmediato; si no, se queda con su
+         * periodo lento de fuera-de-pantalla durante segundos. */
+        apply_screen_schedule(now_ms());
         settings_save();
     }
     return changed;
@@ -7324,6 +7332,8 @@ static int handle_tel_edit_input(unsigned int pressed)
     }
 
     if (changed) {
+        /* FASE F3: lo mismo para las series de telemetria. */
+        apply_screen_schedule(now_ms());
         settings_save();
     }
     return changed;

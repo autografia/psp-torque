@@ -4,6 +4,7 @@ LDFLAGS ?= -lm
 
 SRC = test_main.c test_parser.c test_pid.c test_boost.c \
       test_scheduler.c test_samples.c test_discovery.c test_smooth.c \
+      test_forced_set.c \
       ../src/core/elm327.c ../src/core/pid.c ../src/core/boost.c \
       ../src/core/scheduler.c ../src/core/samples.c ../src/core/profile.c \
       ../src/core/discovery.c ../src/core/smooth.c

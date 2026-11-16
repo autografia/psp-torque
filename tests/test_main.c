@@ -3,6 +3,7 @@
 #include "test_util.h"
 
 #include <stdio.h>
+#include <string.h>
 
 void test_parser(void);
 void test_pid(void);
@@ -12,6 +13,7 @@ void test_samples(void);
 void test_discovery(void);
 void test_smooth(void);
 void test_set_period(void);
+void test_forced_set(void);
 
 int g_failures = 0;
 
@@ -134,6 +136,7 @@ int main(void)
     test_demand_by_screen();
     test_smooth();
     test_set_period();
+    test_forced_set();
 
     if (g_failures != 0) {
         printf("%d comprobaciones fallidas\n", g_failures);

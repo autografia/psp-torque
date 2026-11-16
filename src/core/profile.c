@@ -128,6 +128,21 @@ float obd_profile_demand_all(void)
     return demand;
 }
 
+void obd_forced_set_add(obd_forced_set *set, uint8_t pid)
+{
+    if (pid <= OBD_PID_MAX) {
+        set->pids[pid] = 1;
+    }
+}
+
+int obd_forced_set_has(const obd_forced_set *set, uint8_t pid)
+{
+    if (pid > OBD_PID_MAX) {
+        return 0;
+    }
+    return set->pids[pid] != 0;
+}
+
 /* FASE E2 + A: los periodos estan calibrados contra la capacidad real
  * del enlace ELM327 WiFi, no contra lo que el coche "deberia" dar.
  *

@@ -250,7 +250,9 @@ activa; fuera de ella se multiplican por 4 con tope de 30 s.
 pantalla y deja pendientes de inmediato los PID que acaban de aparecer.
 Los huecos del GENERAL y las series de TELEMETRIA son configurables:
 cualquier PID puede acabar en pantalla, así que se fuerza su periodo base
-con una máscara de 64 bits (el PID 0x33 no cabe en 32).
+con un conjunto de bytes (`obd_forced_set`) que cubre todo el rango de
+OBD-II: una máscara de 64 bits daría comportamiento indefinido con PIDs
+como 0x5C (92).
 
 Demanda por pantalla: GENERAL 13,53 · MOTOR 13,81 · DIAG 12,30 · TELEM
 9,55 req/s, todas por debajo del presupuesto de 14.
