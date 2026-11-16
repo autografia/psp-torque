@@ -195,6 +195,35 @@ Criterios de aceptacion:
       que fijar un hueco minimo).
 - [ ] El retardo percibido al acelerar es < 0,3 s.
 
+## Fase 2.8 — Hueco del adaptador y reparto por pantalla (FASE F1 + F3)
+
+Objetivo: que la aguja deje de dar escalones grandes. Con la FASE E ya no
+habia retardo, pero el RPM se refrescaba 2,14 veces por segundo.
+
+- [x] **F3 — Reparto por pantalla.** El ancho de banda del enlace (~12-14
+  peticiones/s) se reparte segun lo que se esta mirando, no a partes iguales
+  entre los 19 PID. Lo que esta en pantalla va a su periodo base y lo demas
+  se ralentiza. Los PID de diagnostico pasan de 12 s a 1,5 s cuando se mira
+  la pantalla DIAG. El RPM puede ir a 200 ms (5 Hz) sin que el resto se
+  quede sin ancho de banda.
+- [x] **F1 — Hueco minimo al ELM327.** Medido: con hueco 0 el clon v1.5
+  retrasa la respuesta un tick de 16,7 ms y la capacidad cae de 12 a 9,25
+  peticiones/s. El hueco no era tiempo perdido, era un requisito del
+  adaptador. Ajuste `HUECO ELM` en el menu (0-17 ms, defecto 8) y metricas
+  `gap=` y `gapcfg=` en el log para calibrar en un solo viaje.
+- [x] **F2.5 — Edad del dato global robusta.** La edad del panel es la de la
+  muestra mas reciente de cualquier PID: si el RPM se retrasa pero el resto
+  fluye, el panel no da una falsa alarma de "datos viejos".
+
+Criterios de aceptacion:
+
+- [x] La demanda de cada pantalla cabe en el presupuesto del enlace
+      (test `test_demand_by_screen`: 13,53 / 13,81 / 12,30 / 9,55 req/s).
+- [x] Reprogramar el planificador con una peticion en vuelo no lo cuelga
+      (test `test_set_period`).
+- [ ] El RPM se refresca a >= 4,5 Hz en el coche y no quedan STOPPED con
+      el hueco calibrado.
+
 ## Fase 3 — Parámetros específicos Alfa Romeo (investigación)
 
 Tareas:
