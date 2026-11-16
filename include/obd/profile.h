@@ -38,6 +38,7 @@ extern const int PROFILE_QV_POLL_COUNT;
  *  0x11   800  mariposa
  *  0x49   800  pedal (posicion D)
  *  0x4A   800  pedal (posicion E)
+ *  0x5A  1000  pedal (posicion relativa)
  *  0x04  1500  carga
  *  0x05  3000  refrigerante
  *  0x0F  3000  admision

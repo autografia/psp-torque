@@ -2232,18 +2232,109 @@ static void apply_support_masks(void)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Reparto del ancho de banda por pantalla (FASE F3).                  */
+/* ------------------------------------------------------------------ */
+
+/* PID que pinta cada elemento del panel. W_BOOST es derivado (MAP +
+ * baro), asi que no tiene PID propio. */
+static uint8_t widget_pid(int item)
+{
+    switch (item) {
+    case W_RPM:      return 0x0C;
+    case W_SPEED:    return 0x0D;
+    case W_ECT:      return 0x05;
+    case W_IAT:      return 0x0F;
+    case W_MAP:      return 0x0B;
+    case W_MAF:      return 0x10;
+    case W_THR:      return (uint8_t)g_thr_pid;
+    case W_LOAD:     return 0x04;
+    case W_PLATE:    return 0x0D;
+    case W_VOLT:     return 0x42;
+    case W_OIL:      return 0x5C;
+    case W_FUEL:     return 0x2F;
+    case W_STFT:     return 0x06;
+    case W_LTFT:     return 0x07;
+    case W_TIMING:   return 0x0E;
+    case W_O2_1:     return 0x14;
+    case W_O2_2:     return 0x15;
+    case W_DIST_MIL: return 0x21;
+    case W_BARO:     return 0x33;
+    default:         return 0;
+    }
+}
+
+/* Recalcula el periodo de cada PID segun la pantalla activa. Lo que se
+ * esta mirando va a su periodo base; lo demas se ralentiza. Los PID que
+ * acaban de aparecer pasan a estar pendientes de inmediato.
+ *
+ * Los huecos del GENERAL y las series de TELEMETRIA son configurables,
+ * asi que cualquier PID puede acabar en pantalla: se fuerza su periodo
+ * base con la mascara de bits. La mascara es de 64 bits porque el PID
+ * mas alto (0x33 = 51) no cabe en un desplazamiento de 32. */
+static void apply_screen_schedule(uint32_t now)
+{
+    uint8_t mode_mask;
+
+    switch (g_mode) {
+    case MODE_ENGINE:
+        mode_mask = 0x02;
+        break;
+    case MODE_MOTOR:
+        mode_mask = 0x04;
+        break;
+    case MODE_TELEMETRY:
+        mode_mask = 0x08;
+        break;
+    default:
+        mode_mask = 0x01;   /* GENERAL, MODULOS, SNIFFER e INFO */
+        break;
+    }
+
+    uint64_t forced = 0;
+    if (g_mode == MODE_QV) {
+        for (int i = 0; i < DASH_SLOTS; i++) {
+            uint8_t pid = widget_pid(g_slot_item[i]);
+            if (pid != 0) {
+                forced |= (uint64_t)1u << pid;
+            }
+        }
+    } else if (g_mode == MODE_TELEMETRY) {
+        for (int i = 0; i < TEL_SLOTS; i++) {
+            uint8_t pid = widget_pid(g_tel_item[i]);
+            if (pid != 0) {
+                forced |= (uint64_t)1u << pid;
+            }
+        }
+    }
+
+    for (int i = 0; i < g_sched.count; i++) {
+        uint8_t pid = g_sched.items[i].pid;
+        uint8_t mask = obd_profile_visible_mask(pid);
+        int visible = (mask & mode_mask) != 0 ||
+                      (forced & ((uint64_t)1u << pid)) != 0;
+        uint16_t period = obd_profile_period(pid, visible);
+        if (period == 0) {
+            period = 100;   /* PID sin entrada en la tabla (p. ej. 0x5A) */
+        }
+        int was_due = (int32_t)(now - g_sched.items[i].next_due_ms) >= 0;
+        obd_sched_set_period(&g_sched, i, period,
+                             visible && !was_due ? 1 : 0);
+    }
+}
+
 static void build_scheduler(void)
 {
     obd_sched_init(&g_sched);
-
     /* Soporte real declarado por las mascaras de la ECU. */
     g_map_supported = obd_mask_supports(g_mask1, 0x0B);
     g_maf_supported = obd_mask_supports(g_mask1, 0x10);
 
     for (int i = 0; i < PROFILE_QV_POLL_COUNT; i++) {
-        obd_sched_add(&g_sched, PROFILE_QV_POLL[i].pid,
-                                PROFILE_QV_POLL[i].period_ms,
-                                PROFILE_QV_POLL[i].priority);
+        uint8_t pid = PROFILE_QV_POLL[i].pid;
+        obd_sched_add(&g_sched, pid,
+                      obd_profile_base_period(pid),
+                      PROFILE_QV_POLL[i].priority);
     }
     for (int i = 0; i < PROFILE_EXTRA_POLL_COUNT; i++) {
         if (obd_mask_supports(g_mask1, PROFILE_EXTRA_POLL[i].pid)) {
@@ -2251,8 +2342,8 @@ static void build_scheduler(void)
             if (g_cfg.fast && PROFILE_EXTRA_POLL[i].pid == 0x04) {
                 continue;
             }
-            obd_sched_add(&g_sched, PROFILE_EXTRA_POLL[i].pid,
-                          PROFILE_EXTRA_POLL[i].period_ms,
+            uint8_t pid = PROFILE_EXTRA_POLL[i].pid;
+            obd_sched_add(&g_sched, pid, obd_profile_base_period(pid),
                           PROFILE_EXTRA_POLL[i].priority);
         }
     }
@@ -2260,30 +2351,30 @@ static void build_scheduler(void)
     /* Si el coche no tiene MAP pero si MAF, se usa MAF como medida
      * principal. El boost no se puede calcular sin MAP. */
     if (!g_map_supported && g_maf_supported) {
-        obd_sched_add(&g_sched, 0x10, PROFILE_PID_MAF_PERIOD_MS, 1);
+        obd_sched_add(&g_sched, 0x10, obd_profile_base_period(0x10), 1);
     }
 
     /* 0x42: tension del modulo, solo si el bloque 0x40 lo soporta y
      * no estamos en modo rapido. */
     if (!g_cfg.fast && (g_mask3 & 0x40000000u)) {
-        obd_sched_add(&g_sched, 0x42, PROFILE_PID_VOLT_PERIOD_MS, 3);
+        obd_sched_add(&g_sched, 0x42, obd_profile_base_period(0x42), 3);
     }
 
     /* Aceite y combustible, solo si estan soportados. */
     g_oil_supported = (g_mask3 & 0x00000010u) ? 1 : 0;
     g_fuel_supported = (g_mask2 & 0x00020000u) ? 1 : 0;
     if (!g_cfg.fast && g_oil_supported) {
-        obd_sched_add(&g_sched, 0x5C, PROFILE_PID_OIL_PERIOD_MS, 4);
+        obd_sched_add(&g_sched, 0x5C, obd_profile_base_period(0x5C), 4);
     }
     if (!g_cfg.fast && g_fuel_supported) {
-        obd_sched_add(&g_sched, 0x2F, PROFILE_PID_FUEL_PERIOD_MS, 4);
+        obd_sched_add(&g_sched, 0x2F, obd_profile_base_period(0x2F), 4);
     }
 
     /* Motor avanzado: trims, avance, lambda, distancia con MIL. */
     if (!g_cfg.fast) {
         for (int i = 0; i < PROFILE_MOTOR_POLL_COUNT; i++) {
-            obd_sched_add(&g_sched, PROFILE_MOTOR_POLL[i].pid,
-                          PROFILE_MOTOR_POLL[i].period_ms,
+            uint8_t pid = PROFILE_MOTOR_POLL[i].pid;
+            obd_sched_add(&g_sched, pid, obd_profile_base_period(pid),
                           PROFILE_MOTOR_POLL[i].priority);
         }
     }
@@ -2295,17 +2386,17 @@ static void build_scheduler(void)
     g_thr_label = "MARIPOSA";
     g_pedal_supported = 0;
     if (g_mask3 & 0x00800000u) {          /* bit 0x49 */
-        obd_sched_add(&g_sched, 0x49, PROFILE_PID_PEDAL_PERIOD_MS, 1);
+        obd_sched_add(&g_sched, 0x49, obd_profile_base_period(0x49), 1);
         g_thr_pid = 0x49;
         g_thr_label = "ACELERADOR";
         g_pedal_supported = 1;
     } else if (g_mask3 & 0x00400000u) {   /* bit 0x4A */
-        obd_sched_add(&g_sched, 0x4A, PROFILE_PID_PEDAL_PERIOD_MS, 1);
+        obd_sched_add(&g_sched, 0x4A, obd_profile_base_period(0x4A), 1);
         g_thr_pid = 0x4A;
         g_thr_label = "ACELERADOR";
         g_pedal_supported = 1;
     } else if (g_mask3 & 0x00000040u) {   /* bit 0x5A */
-        obd_sched_add(&g_sched, 0x5A, 200, 1);
+        obd_sched_add(&g_sched, 0x5A, obd_profile_base_period(0x5A), 1);
         g_thr_pid = 0x5A;
         g_thr_label = "ACELERADOR";
         g_pedal_supported = 1;
@@ -2319,6 +2410,9 @@ static void build_scheduler(void)
     log_file_printf("Soporte: aceite=%s combustible=%s mariposa=0x11\n",
                     g_oil_supported ? "SI" : "NO",
                     g_fuel_supported ? "SI" : "NO");
+
+    /* FASE F3: los periodos dependen de la pantalla activa. */
+    apply_screen_schedule(now_ms());
 }
 
 /* ------------------------------------------------------------------ */
@@ -6916,6 +7010,12 @@ static int handle_mode_input(unsigned int pressed)
     if (pressed & (PSP_CTRL_LTRIGGER | PSP_CTRL_LEFT)) {
         g_mode = (g_mode + MODE_COUNT - 1) % MODE_COUNT;
         changed = 1;
+    }
+
+    /* FASE F3: al cambiar de pantalla se reparte el ancho de banda.
+     * Los datos que acaban de aparecer pasan a pedirse de inmediato. */
+    if (changed && !g_settings_open) {
+        apply_screen_schedule(now_ms());
     }
 
     if (g_mode == MODE_TELEMETRY && !g_settings_open) {

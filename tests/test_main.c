@@ -11,6 +11,7 @@ void test_scheduler(void);
 void test_samples(void);
 void test_discovery(void);
 void test_smooth(void);
+void test_set_period(void);
 
 int g_failures = 0;
 
@@ -132,6 +133,7 @@ int main(void)
     test_data_age();
     test_demand_by_screen();
     test_smooth();
+    test_set_period();
 
     if (g_failures != 0) {
         printf("%d comprobaciones fallidas\n", g_failures);

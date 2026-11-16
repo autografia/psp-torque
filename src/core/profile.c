@@ -24,6 +24,7 @@ static const struct {
     { 0x11, 1000,  0x07, 0 },  /* mariposa: general, motor y telem */
     { 0x49, 1000,  0x03, 1 },  /* pedal (posicion D) */
     { 0x4A, 1000,  0x03, 1 },  /* pedal (posicion E): alternativa del D */
+    { 0x5A, 1000,  0x03, 1 },  /* pedal (posicion relativa): alternativa */
     { 0x04, 2000,  0x03, 0 },  /* carga: general y motor */
     { 0x05, 3000,  0x0F, 0 },  /* refrigerante: en todas */
     { 0x0F, 3000,  0x0F, 0 },  /* admision: en todas */
