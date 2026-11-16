@@ -286,9 +286,79 @@ Se clasifican en tres montones:
 - Cada cambio del hueco escribe una línea en el log, para poder segmentar un viaje de calibración en un solo fichero.
 - La enforcement no bloqueante: cuando el hueco mínimo aún no ha pasado, el bucle no envía y duerme 2 ms (en vez de `sceDisplayWaitVblankStart()`); el acumulador `gap_acc` se mueve a esa ruta de envío diferida.
 
-### 11.3 Pendientes de decisión humana
+### 11.3 Decisiones del usuario
 
-| # | Pregunta | Por qué la decide el usuario |
+| # | Decisión | Detalle |
 |---|---|---|
-| 2 | **¿Qué PIDs pagan el ancho de banda para subir el RPM?** | Con la tabla actual la demanda es 12,05 req/s y el RPM está a 4 Hz nominales (3,00 Hz reales). Subirlo a 5 Hz (200 ms) son 13,05 req/s y a 6 Hz (167 ms) son 14,05. La capacidad **nunca se ha medido por encima de 12,05 req/s**: depende del hueco mínimo, que se calibra en el viaje. Hay que decidir qué se sacrifica: temperatura de refrigerante/admisión (4 s), trims/O2/distancia (12 s) o el propio MAP (500 ms). Afecta a lo que se ve en la pestaña MOTOR. |
-| 5 | **¿La edad del dato es global o por PID?** | Hoy la edad sale de la muestra de RPM (o MAP) y aturde **todo** el panel. Si el RPM se retrasa 1 s mientras el resto fluye, el panel entero se apaga y avisa "DATOS VIEJOS": una falsa alarma. Dos salidas: (a) **global robusta** = edad de la muestra más reciente de **cualquier** PID (el panel está vivo si llega algo; cada gauge puede mostrar un valor viejo sin que eso se note), o (b) **por PID**, cada gauge se atenúa con la edad de su propio dato (más preciso, más trabajo: hay que tocar cada punto de dibujo). Afecta a cuántos falsos avisos ve el usuario conduciendo. |
+| 5 | **Edad del dato: global robusta** | La edad del panel es la de la **muestra más reciente de cualquier PID**, no la del RPM. El panel se apaga solo cuando no llega nada (enlace muerto de verdad) y no hay falsas alarmas cuando un PID concreto se retrasa. Se calcula recorriendo el almacén de muestras (24 entradas, coste nulo). |
+| 2 | **Reparto por pantalla** (propuesta del usuario) | El ancho de banda se reparte **según la pantalla activa**: lo que se está mirando va a su periodo base; lo que no, a un periodo lento (×4). En GENERAL solo hay ~5 datos visibles, así que el resto no compite por el enlace. Ver §12. |
+
+---
+
+## 12. FASE F3 — Sondeo por pantalla
+
+### 12.1 Principio
+
+El enlace da ~12 peticiones/s. Repartidas a partes iguales entre 17 PID, cada
+uno va a ~0,7 Hz. Pero **no todos los datos se están mirando a la vez**: en
+GENERAL hay ~5 datos visibles y los 6 de diagnóstico no aparecen en absoluto.
+
+La regla: **un PID se pide a su periodo base si está en la pantalla activa, y
+a su periodo base × 4 si no**. Así el ancho de banda va donde está la atención
+y el tacómetro puede ir más rápido sin que las temperaturas del MOTOR
+desaparezcan.
+
+### 12.2 Periodos base (con el PID en pantalla)
+
+| PID | Base | Antes (fijo) |
+|---|---|---|
+| 0x0C RPM | **200 ms** (5 Hz) | 250 ms |
+| 0x0B MAP | 400 ms | 500 ms |
+| 0x0D velocidad | 800 ms | 800 ms |
+| 0x11 / 0x49 mariposa / pedal | 800 ms | 1000 ms |
+| 0x04 carga | 1500 ms | 2000 ms |
+| 0x05 / 0x0F ECT / IAT | 3000 ms | 4000 ms |
+| 0x06 / 0x07 / 0x0E / 0x14 / 0x15 | 1000 ms | 12000 ms |
+| 0x21 distancia MIL | 2000 ms | 12000 ms |
+| 0x42 voltaje | 5000 ms | 10000 ms |
+| 0x5C aceite | 10000 ms | 10000 ms |
+| 0x2F combustible | 10000 ms | 20000 ms |
+| 0x33 baro | 30000 ms | 20000 ms |
+
+Fuera de pantalla: base × 4 (tope 30 s).
+
+### 12.3 Conjuntos visibles
+
+| Pantalla | PIDs visibles |
+|---|---|
+| GENERAL | los 6 huecos configurables (`g_slot_item[]` → su PID) |
+| MOTOR | MAP/MAF, ECT, IAT, mariposa/pedal, carga, voltaje, aceite, combustible |
+| DIAG | STFT, LTFT, avance, O2-1, O2-2, distancia MIL, voltaje, combustible |
+| TELEM | las 5 series seleccionadas por el usuario |
+| MODULOS / SNIFFER / INFO | el conjunto base (como GENERAL) |
+
+### 12.4 Demanda resultante
+
+| Pantalla | Demanda |
+|---|---|
+| GENERAL | ~11,8 req/s |
+| MOTOR | ~9,4 req/s |
+| DIAG | ~8,7 req/s |
+| TELEM | ~10,6 req/s |
+
+Con la capacidad medida (~12 req/s con hueco de 8 ms) **el RPM puede ir a
+5 Hz y todo sigue cabiendo**. Es la respuesta a la pregunta de qué PIDs pagan
+el ancho de banda: paga el hecho de que en cada pantalla solo se pide lo que
+se ve.
+
+### 12.5 Implementación
+
+- Núcleo: `obd_profile_period(pid, visible)` devuelve el periodo efectivo.
+  `obd_sched_set_period(sched, idx, period_ms, due_now)` permite cambiarlo en
+  caliente.
+- Capa PSP: `visible_pids_for_mode(mask)` calcula el conjunto visible del modo
+  actual (incluidos los huecos y las series configurables por el usuario).
+- Al cambiar de pantalla: se recalculan los periodos y los PID que acaban de
+  aparecer pasan a estar pendientes de inmediato.
+- Test del núcleo: la demanda **de cada pantalla** tiene que caber en el
+  presupuesto.
