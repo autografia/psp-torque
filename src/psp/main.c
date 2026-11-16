@@ -276,6 +276,16 @@ typedef struct {
 static app_settings g_cfg = { 0, 0, 0, 1, 1, 0, 1, 0,
                               4000, 7000, 0, 1, 0, 15, 100, 9, 1, 0 };
 
+/* FASE F1: hueco minimo entre el fin de una respuesta y el envio del
+ * siguiente comando al ELM327. Medido: con 0 ms el clon retrasa su
+ * respuesta un tick de 16,7 ms y la capacidad cae de ~12 a ~9,25
+ * peticiones/s. 8 ms es el valor conocido-bueno; el ajuste del menu
+ * permite calibrar el umbral real de cada adaptador. */
+#define ELM_GAP_DEFAULT_MS 8
+static const int g_elm_gap_values[7] = { 0, 2, 4, 6, 8, 12, 17 };
+static int g_elm_min_gap_ms = ELM_GAP_DEFAULT_MS;
+static uint32_t g_last_resp_ms = 0;   /* anclaje del hueco */
+
 static float tach_max_rpm(void)
 {
     return (float)g_cfg.rpm_max;
@@ -448,6 +458,7 @@ static const char *tr(const char *key)
         { "TURBO AUTO", "TURBO AUTO" },
         { "BOOST MAX", "BOOST MAX" },
         { "IDIOMA", "LANGUAGE" },
+        { "HUECO ELM", "ELM GAP" },
         { "ELM ATASCADO", "ELM STUCK" },
         { "DATOS VIEJOS", "OLD DATA" },
         { "GENERAL", "GENERAL" },
@@ -483,8 +494,8 @@ static const char *tr(const char *key)
     return key;
 }
 
-#define SET_COUNT 16
-#define SET_EXIT  15
+#define SET_COUNT 17
+#define SET_EXIT  16
 
 static int g_settings_open = 0;
 static int g_settings_sel = 0;
@@ -865,6 +876,17 @@ static void settings_load(void)
                     g_cfg.show_fps = atoi(val) ? 1 : 0;
                 } else if (strcmp(key, "debug") == 0) {
                     g_cfg.debug = atoi(val) ? 1 : 0;
+                } else if (strcmp(key, "elm_gap") == 0 ||
+                           strcmp(key, "hueco_elm") == 0) {
+                    int v = atoi(val);
+                    int valid = 0;
+                    for (int k = 0; k < 7; k++) {
+                        if (g_elm_gap_values[k] == v) {
+                            valid = 1;
+                            break;
+                        }
+                    }
+                    g_elm_min_gap_ms = valid ? v : ELM_GAP_DEFAULT_MS;
                 } else if (strncmp(key, "slot", 4) == 0 &&
                            key[4] >= '0' && key[4] <= '5') {
                     int si = key[4] - '0';
@@ -981,6 +1003,8 @@ static void settings_save(void)
                      "# boost_max: fondo de escala manual (decimas de bar)\n"
                      "# slotN_item/style: que dato y como se pinta cada hueco\n"
                      "# telN_item: series de la pestana TELEMETRIA\n"
+                     "# elm_gap: hueco minimo entre comandos al ELM327 (ms)\n"
+                     "#   0/2/4/6/8/12/17; 8 es el valor recomendado\n"
                      "theme=%d\n"
                      "color=%d\n"
                      "idioma=%d\n"
@@ -1007,7 +1031,8 @@ static void settings_save(void)
                      "tel3_item=%d\n"
                      "tel4_item=%d\n"
                      "fps_show=%d\n"
-                     "debug=%d\n",
+                     "debug=%d\n"
+                     "elm_gap=%d\n",
                      g_cfg.theme, g_cfg.color, g_cfg.lang, g_cfg.contrast, g_cfg.anim,
                      g_cfg.fast, g_cfg.peak_hold,
                      g_cfg.smooth, g_cfg.shift_rpm, g_cfg.rpm_max,
@@ -1021,7 +1046,7 @@ static void settings_save(void)
                      g_slot_item[5], g_slot_style[5],
                      g_tel_item[0], g_tel_item[1], g_tel_item[2],
                      g_tel_item[3], g_tel_item[4],
-                     g_cfg.show_fps, g_cfg.debug);
+                     g_cfg.show_fps, g_cfg.debug, g_elm_min_gap_ms);
     if (n > (int)sizeof(buf) - 1) {
         n = (int)sizeof(buf) - 1;
     }
@@ -5700,7 +5725,7 @@ static void draw_settings_overlay(void)
     const float w = 464.0f;
     const float h = 238.0f;
     const int items = SET_COUNT;
-    const int per_col = 8;
+    const int per_col = 9;
     const float colw = 218.0f;
 
     /* Sombra y panel. */
@@ -5716,7 +5741,7 @@ static void draw_settings_overlay(void)
         int col = i / per_col;
         int row = i % per_col;
         float cx = x + 12.0f + (float)col * (colw + 8.0f);
-        float ry = y + 42.0f + (float)row * 21.0f;
+        float ry = y + 42.0f + (float)row * 19.0f;
         int selected = (g_settings_sel == i);
 
         if (selected) {
@@ -5748,27 +5773,30 @@ static void draw_settings_overlay(void)
             snprintf(value, sizeof(value), "%s",
                      g_cfg.fast ? "RAPIDO" : "COMPLETO");
         } else if (i == 5) {
+            label = tr("HUECO ELM");
+            snprintf(value, sizeof(value), "%d ms", g_elm_min_gap_ms);
+        } else if (i == 6) {
             label = tr("EDITAR VISTA");
             snprintf(value, sizeof(value), "ABRIR");
-        } else if (i == 6) {
+        } else if (i == 7) {
             label = tr("PICO MAX");
             snprintf(value, sizeof(value), "%s",
                      g_cfg.peak_hold ? "SI" : "NO");
-        } else if (i == 7) {
+        } else if (i == 8) {
             label = tr("SHIFT RPM");
             snprintf(value, sizeof(value), "%d", g_cfg.shift_rpm);
-        } else if (i == 8) {
+        } else if (i == 9) {
             label = tr("RPM MAX");
             snprintf(value, sizeof(value), "%d", g_cfg.rpm_max);
-        } else if (i == 9) {
+        } else if (i == 10) {
             label = tr("UNIDADES");
             snprintf(value, sizeof(value), "%s",
                      g_units_names[g_cfg.units]);
-        } else if (i == 10) {
+        } else if (i == 11) {
             label = tr("TURBO AUTO");
             snprintf(value, sizeof(value), "%s",
                      g_cfg.boost_auto ? "SI" : "NO");
-        } else if (i == 11) {
+        } else if (i == 12) {
             label = tr("BOOST MAX");
             char v[16];
             fmt_1(v, sizeof(v), boost_max_bar());
@@ -5779,15 +5807,15 @@ static void draw_settings_overlay(void)
                 snprintf(value, sizeof(value), "%s %s", v,
                          units_press_name());
             }
-        } else if (i == 12) {
+        } else if (i == 13) {
             label = tr("IDIOMA");
             const char *names[3] = { "AUTO", "ESPANOL", "ENGLISH" };
             snprintf(value, sizeof(value), "%s", names[g_cfg.lang]);
-        } else if (i == 13) {
+        } else if (i == 14) {
             label = "FPS";
             snprintf(value, sizeof(value), "%s",
                      g_cfg.show_fps ? "SI" : "NO");
-        } else if (i == 14) {
+        } else if (i == 15) {
             label = "DEBUG";
             snprintf(value, sizeof(value), "%s",
                      g_cfg.debug ? "SI" : "NO");
@@ -7096,7 +7124,7 @@ static int handle_settings_input(unsigned int pressed)
     int changed = 0;
 
     if (pressed & PSP_CTRL_CROSS) {
-        if (g_settings_sel == 5) {
+        if (g_settings_sel == 6) {
             g_edit_open = 1;
             g_edit_sel = 0;
             return 1;
@@ -7161,26 +7189,42 @@ static int handle_settings_input(unsigned int pressed)
             g_cfg.anim = !g_cfg.anim;
         } else if (g_settings_sel == 4) {
             g_cfg.fast = !g_cfg.fast;
-        } else if (g_settings_sel == 6) {
-            g_cfg.peak_hold = !g_cfg.peak_hold;
+        } else if (g_settings_sel == 5) {
+            /* FASE F1: se recorre la lista de valores del hueco, no se
+             * suma 1 ms libre: el umbral del ELM327 se mide en pasos. */
+            int idx = 0;
+            for (int k = 0; k < 7; k++) {
+                if (g_elm_gap_values[k] == g_elm_min_gap_ms) {
+                    idx = k;
+                    break;
+                }
+            }
+            idx += dir;
+            if (idx < 0) idx = 0;
+            if (idx > 6) idx = 6;
+            g_elm_min_gap_ms = g_elm_gap_values[idx];
+            log_file_printf("AJUSTE: hueco ELM = %d ms\n", g_elm_min_gap_ms);
+            log_sync();
         } else if (g_settings_sel == 7) {
+            g_cfg.peak_hold = !g_cfg.peak_hold;
+        } else if (g_settings_sel == 8) {
             g_cfg.shift_rpm += dir * 100;
             if (g_cfg.shift_rpm < 2000) g_cfg.shift_rpm = 2000;
             if (g_cfg.shift_rpm > g_cfg.rpm_max) {
                 g_cfg.shift_rpm = g_cfg.rpm_max;
             }
-        } else if (g_settings_sel == 8) {
+        } else if (g_settings_sel == 9) {
             g_cfg.rpm_max += dir * 500;
             if (g_cfg.rpm_max < 4000) g_cfg.rpm_max = 4000;
             if (g_cfg.rpm_max > 9000) g_cfg.rpm_max = 9000;
             if (g_cfg.shift_rpm > g_cfg.rpm_max) {
                 g_cfg.shift_rpm = g_cfg.rpm_max;
             }
-        } else if (g_settings_sel == 9) {
-            g_cfg.units = (g_cfg.units + 1) % 2;
         } else if (g_settings_sel == 10) {
-            g_cfg.boost_auto = !g_cfg.boost_auto;
+            g_cfg.units = (g_cfg.units + 1) % 2;
         } else if (g_settings_sel == 11) {
+            g_cfg.boost_auto = !g_cfg.boost_auto;
+        } else if (g_settings_sel == 12) {
             /* Ajustar a mano el fondo de escala pasa a modo manual. */
             if (g_cfg.boost_auto) {
                 g_cfg.boost_auto = 0;
@@ -7189,13 +7233,13 @@ static int handle_settings_input(unsigned int pressed)
             g_cfg.boost_max += dir;
             if (g_cfg.boost_max < 5) g_cfg.boost_max = 5;
             if (g_cfg.boost_max > 30) g_cfg.boost_max = 30;
-        } else if (g_settings_sel == 12) {
+        } else if (g_settings_sel == 13) {
             g_cfg.lang += dir;
             if (g_cfg.lang < 0) g_cfg.lang = 0;
             if (g_cfg.lang > 2) g_cfg.lang = 2;
-        } else if (g_settings_sel == 13) {
-            g_cfg.show_fps = !g_cfg.show_fps;
         } else if (g_settings_sel == 14) {
+            g_cfg.show_fps = !g_cfg.show_fps;
+        } else if (g_settings_sel == 15) {
             g_cfg.debug = !g_cfg.debug;
         }
 
@@ -7577,15 +7621,26 @@ static void run_dashboard(Target *targets, int target_count)
         }
         boost_learn_update(now);
 
-        /* FASE D1: lectura OBD no bloqueante. Solo hay una peticion en
-         * vuelo; nunca se envia un comando nuevo mientras hay una
-         * pendiente. El estado se avanza una vez por iteracion. */
+        /* FASE D1 + F1: lectura OBD no bloqueante con hueco minimo. */
         int rx_ready = 0;
+        int gap_pending = 0;
         if (sock >= 0 && !g_demo) {
             if (!rx.active) {
-                int sent = obd_send_next(sock, &rx, &rx_idx, &rx_pid, &rx_t0);
-                if (sent < 0) {
-                    rx_ready = 1;
+                /* FASE F1: si el ELM327 aun no ha tenido su silencio,
+                 * no se envia nada: el bucle sigue y la espera de la
+                 * cadencia duerme 2 ms en vez de un VBlank. */
+                if (g_last_resp_ms != 0u &&
+                    (int32_t)(now_ms() - g_last_resp_ms) < g_elm_min_gap_ms) {
+                    gap_pending = 1;
+                } else {
+                    int sent = obd_send_next(sock, &rx, &rx_idx,
+                                             &rx_pid, &rx_t0);
+                    if (sent > 0 && g_last_resp_ms != 0u) {
+                        gap_acc += (uint32_t)(rx_t0 - g_last_resp_ms);
+                        gap_n++;
+                    } else if (sent < 0) {
+                        rx_ready = 1;
+                    }
                 }
             } else if (elm_rx_step(&rx) != ELM_RX_PENDING) {
                 rx_ready = 1;
@@ -7595,6 +7650,10 @@ static void run_dashboard(Target *targets, int target_count)
             elm_reply *reply = &rx.reply;
             uint8_t pid = rx_pid;
             uint32_t t1 = now_ms();
+
+            /* FASE F1: se ancla el hueco en el instante en que la
+             * respuesta se completo. */
+            g_last_resp_ms = t1;
 
             last_rtt = (int)(t1 - rx_t0);
             requests++;
@@ -7688,27 +7747,11 @@ static void run_dashboard(Target *targets, int target_count)
 
             memset(&rx, 0, sizeof(rx));
 
-            /* FASE C: la peticion siguiente sale YA. Antes habia un
-             * hueco de ~24 ms entre el fin de una respuesta y el envio
-             * de la siguiente (espera del frame + espera fina + preambulo
-             * del bucle). Ese hueco se comia un tercio del ciclo de 83 ms
-             * y era lo que limitaba el enlace a 12 peticiones/s.
-             *
-             * Se mide el hueco resultante con la metrica "gap" del log:
-             * si el ELM327 no tolera recibir el comando tan pronto
-             * apareceran STOPPED y habra que buscar el minimo seguro. */
-            if (sock >= 0 && !g_demo) {
-                uint32_t prev_done = (uint32_t)t1;
-                int sent = obd_send_next(sock, &rx, &rx_idx, &rx_pid, &rx_t0);
-                if (sent > 0) {
-                    gap_acc += (uint32_t)(rx_t0 - prev_done);
-                    gap_n++;
-                }
-                /* Si el envio falla, el socket esta muerto. No se cuenta
-                 * aqui: la siguiente iteracion lo reintenta, falla otra
-                 * vez y el contador de timeouts de la ruta normal lleva
-                 * la cuenta (y dispara la reconexion al llegar a 8). */
-            }
+            /* FASE F1: el comando siguiente no se envia aqui. El
+             * planificador lo enviara en la siguiente iteracion, tras
+             * comprobar que ha pasado el hueco minimo. Si el envio
+             * fallase, la ruta normal cuenta el timeout y dispara la
+             * reconexion al llegar a 8. */
 
             /* FASE E1: la peticion acaba de completarse. Se marca para
              * que la espera siguiente sea de 2 ms y no un VBlank entero:
@@ -7777,20 +7820,10 @@ static void run_dashboard(Target *targets, int target_count)
         if (draw_due) {
             draw_screen(now, requests, data_count,
                         no_data_count, timeouts, last_rtt);
-        } else if (rx.active || rx_just_done) {
-            /* FASE E1: hay una peticion OBD en vuelo (o acaba de
-             * completarse). En vez de esperar un VBlank entero
-             * (16,7 ms), se duerme 2 ms y se vuelve a mirar el socket.
-             *
-             * Antes, la deteccion de la respuesta solo podia ocurrir en
-             * el siguiente frame, y el siguiente comando salia en la
-             * iteracion posterior: 16,7 ms de cuantizacion + 16,7 ms de
-             * hueco muerto en cada peticion. Medido sobre el log de un
-             * viaje real, eran ~26 ms de los ~72 ms de cada ciclo.
-             * Con 2 ms el ciclo baja a ~55 ms y el enlace da ~18
-             * peticiones/s en vez de 12,6.
-             *
-             * El dibujo no se resiente: la cadencia sigue la cuenta de
+        } else if (rx.active || rx_just_done || gap_pending) {
+            /* Con una peticion en vuelo, o esperando el hueco minimo del
+             * adaptador, se duerme 2 ms en vez de un VBlank (16,7 ms).
+             * El dibujo no se resiente: su cadencia sigue la cuenta de
              * VBlanks, no la del bucle. */
             sceKernelDelayThread(2000);
         } else {
@@ -7816,11 +7849,13 @@ static void run_dashboard(Target *targets, int target_count)
             if (sample_value(0x0D, now, &f)) fmt_0(spd, sizeof(spd), f);
 
             log_file_printf("t=%u rpm=%s map=%s boost=%s ect=%s iat=%s "
-                            "spd=%s rtt=%d gap=%d ok=%d nd=%d to=%d fps=%d "
+                            "spd=%s rtt=%d gap=%d gapcfg=%d ok=%d nd=%d "
+                            "to=%d fps=%d "
                             "cpu=%u wait=%u int=%u vb=%d v=%d%s\n",
                             (unsigned)(session_ms / 1000), rpm, map,
                             boost, ect, iat, spd, last_rtt,
                             (int)(gap_n ? (gap_acc / gap_n) : 0),
+                            g_elm_min_gap_ms,
                             data_count, no_data_count, timeouts,
                             g_fps,
                             (unsigned)(g_perf_cpu_us / 1000u),
