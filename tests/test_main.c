@@ -14,6 +14,8 @@ void test_discovery(void);
 void test_smooth(void);
 void test_set_period(void);
 void test_forced_set(void);
+void test_vehicle(void);
+void test_oil(void);
 void test_alert_invalid_data(void);
 void test_alert_thresholds(void);
 void test_alert_priority(void);
@@ -140,6 +142,8 @@ int main(void)
     test_smooth();
     test_set_period();
     test_forced_set();
+    test_vehicle();
+    test_oil();
     test_alert_invalid_data();
     test_alert_thresholds();
     test_alert_priority();
