@@ -47,6 +47,10 @@ whatever your ECU actually supports.
   `TEXTO` (text) or `OCULTO` (hidden), and you pick which value it shows.
 - **ECU module discovery** (OBD‑II and UDS identification) and a **CAN bus
   sniffer** that captures the whole session traffic.
+- **Global alerts:** coolant, intake temperature and battery warnings shown
+  in the header, visible from any screen.
+- **Reconnect without losing data:** the last readings stay dimmed on screen
+  while the adapter reconnects instead of vanishing.
 - **Demo mode** with a ~130 s synthetic driving profile, so you can try the
   interface without a car.
 - **Per-session log** on the Memory Stick, including performance metrics

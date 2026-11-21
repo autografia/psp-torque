@@ -286,6 +286,9 @@ SIN ADAPTADOR
   Si el ELM327 no esta encendido o no se conecta, la app muestra
   igualmente el dashboard grafico con todos los valores en N/D y el
   estado DESCONECT. Sirve para probar la interfaz sin el coche.
+  Si se pierde el enlace con el adaptador, aparece REINTENTANDO n/3 y
+  los ultimos valores se mantienen atenuados en pantalla, no desaparecen.
+  Si el adaptador se queda atascado, la cabecera dice ELM ATASCADO.
   Pulsa TRIANGLE para reintentar WiFi, SQUARE para configurarlo,
   L/R para cambiar de pantalla, L+R 1,5 s para el modo demo y
   START > SALIR > X para salir.

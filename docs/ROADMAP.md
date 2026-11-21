@@ -279,6 +279,21 @@ muestra de mas de 6 s y las cajas invalidas se compactaban.
 - [x] Aplicado a las rejillas MOTOR y DIAG (STFT, LTFT, avance, O2, MIL,
   voltaje, combustible) y a todas sus cajas.
 
+## Fase 2.12 — Reconexión sin perder datos y aviso global (fase2.47)
+
+- [x] **Reconexión sin borrar los valores**: al perder el enlace por un
+  atasco en STOPPED se conserva el socket para probar `ATZ` antes de
+  desconectar el WiFi. `g_store` y `g_boost` se guardan por valor y se
+  restauran si el `ATZ` funciona. Durante la reconexión el contenido
+  queda atenuado al 55%, legible, con `REINTENTANDO n/3` a brillo completo.
+- [x] **`ATZ` antes del WiFi**: si el ELM327 responde al reset, se rehace
+  el handshake sobre la misma conexión TCP y se evitan los 10-30 s del
+  ciclo WiFi. El log escribe `Recuperacion: ATZ OK` o `ATZ fallo -> WiFi`
+  para medirlo.
+- [x] **Aviso global en la cabecera**, visible en las cinco pestañas:
+  ECT ≥ 105 °C (ámbar) / ≥ 115 °C (rojo), IAT ≥ 70 °C, voltaje < 11,5 V.
+  Parpadea con el VBlank y muestra `+1` si hay más de un aviso activo.
+
 ## Fase 3 — Parámetros específicos Alfa Romeo (investigación)
 
 Tareas:

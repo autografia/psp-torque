@@ -47,6 +47,10 @@ capacidades reales de cualquier ECU.
   `OCULTO`, y se elige qué dato muestra.
 - **Descubrimiento de centralitas** (OBD‑II y UDS de identificación) y
   **sniffer de bus CAN** para capturar el tráfico completo de la sesión.
+- **Avisos globales:** temperatures (refrigerante, admisión) y batería con
+  aviso en la cabecera, visible en cualquier pantalla.
+- **Reconexión sin perder datos:** los últimos valores quedan atenuados en
+  pantalla mientras se reconecta, en vez de desaparecer.
 - **Modo demo** con un perfil de conducción simulado de ~130 s, para probar la
   interfaz sin coche.
 - **Log por sesión** en la Memory Stick, con métricas de rendimiento

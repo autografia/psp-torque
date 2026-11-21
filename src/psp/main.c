@@ -61,7 +61,7 @@ PSP_HEAP_SIZE_KB(4096);
 #define DEFAULT_HOST "192.168.0.10"
 #define DEFAULT_PORT 35000
 #define MAX_TARGETS 4
-#define BUILD_TAG "fase2.46 2026-11-21 cajas lentas atenuadas en vez de ocultas"
+#define BUILD_TAG "fase2.47 2026-11-21 reconexion sin perder datos y avisos globales"
 #define CMD_TIMEOUT_MS 500
 /* Si el adaptador ha demostrado que envia el prompt '>', hay que esperarlo
  * antes de mandar el siguiente comando. El ELM327 hace tareas internas
