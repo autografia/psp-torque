@@ -39,6 +39,7 @@
 
 #include "obd/boost.h"
 #include "obd/discovery.h"
+#include "obd/alert.h"
 #include "obd/elm327.h"
 #include "obd/pid.h"
 #include "obd/profile.h"
@@ -286,6 +287,10 @@ static app_settings g_cfg = { 0, 0, 0, 1, 1, 0, 1, 0,
 static const int g_elm_gap_values[7] = { 0, 2, 4, 6, 8, 12, 17 };
 static int g_elm_min_gap_ms = ELM_GAP_DEFAULT_MS;
 static uint32_t g_last_resp_ms = 0;   /* anclaje del hueco */
+
+/* FASE 2.12: cuando el adaptador se atasca en STOPPED se prueba un ATZ
+ * sobre la conexion actual antes de tirar el WiFi. */
+static int g_try_atz = 0;
 
 static float tach_max_rpm(void)
 {
@@ -2504,6 +2509,7 @@ static int connect_network_and_elm(Target *targets, int *target_count,
     g_link_connected = 0;
     g_connect_cancel = 0;
     g_elm_stuck = 0;
+    g_try_atz = 0;
 
     obd_store_init(&g_store);
     boost_init(&g_boost, PROFILE_BARO_FALLBACK_KPA);
@@ -4427,10 +4433,13 @@ static void qv_tile(float x, float y, float w, float h,
     }
 }
 
-static void draw_top_bar(int connected, int stale, uint32_t age_ms)
+static void draw_top_bar(int connected, int stale, uint32_t age_ms,
+                         float ect, int ect_valid,
+                         float iat, int iat_valid,
+                         float volt, int volt_valid)
 {
-    /* La cabecera no se atenua: es donde vive el aviso de que el dato
-     * esta viejo, asi que tiene que seguir leyendose siempre. */
+    /* La cabecera no se atenua: es donde vive el aviso, tiene que
+     * seguir leyendose siempre. */
     int saved_dim = g_gfx_dim;
     g_gfx_dim = 100;
 
@@ -4504,9 +4513,31 @@ static void draw_top_bar(int connected, int stale, uint32_t age_ms)
                  (unsigned)(session_s % 60u));
     }
 
+    /* FASE 2.12: aviso global, visible en cualquier pestaña. */
+    obd_alert al = obd_alert_eval(ect, ect_valid, iat, iat_valid,
+                                  volt, volt_valid);
+    int warn_width = 0;
+    if (al.level != OBD_ALERT_NONE) {
+        char warn[40];
+        snprintf(warn, sizeof(warn), "! %s%s", obd_alert_text(al.kind),
+                 al.more ? " +1" : "");
+        warn_width = gfx_text_width(warn, 1);
+        /* Parpadeo con el VBlank: medio segundo visible, medio oculto. */
+        if (((now_ms() / 500u) & 1u) == 0u) {
+            uint32_t wc = (al.level == OBD_ALERT_CRIT) ? QV_CRIT : QV_AMBER;
+            gfx_text(16, 8, warn, wc, 1);
+        }
+    }
+
     char righttop[40];
     snprintf(righttop, sizeof(righttop), "%s  %s", state, tb);
     int right_x = GFX_W - 8 - gfx_text_width(righttop, 1);
+    if (warn_width > 0 && right_x < 16 + warn_width + 8) {
+        /* No cabe: se recorta el estado para que el aviso siempre
+         * se lea. El aviso manda. */
+        righttop[4] = '\0';
+        right_x = GFX_W - 8 - gfx_text_width(righttop, 1);
+    }
     gfx_circle((float)(right_x - 9), 12.0f, 4.0f, dot);
     gfx_text(right_x, 8, righttop, state_color, 1);
 
@@ -6974,10 +7005,9 @@ static void draw_screen(uint32_t now, int requests, int data_count,
     int stale = data_is_stale(now);
     uint32_t age_ms = data_age_ms(now);
 
-    /* FASE F2: si el dato envejece, el contenido se apaga (el marco se
-     * queda). El panel deja de parecer congelado y empieza a explicar
-     * que lo que hay dentro ya no es de ahora. */
-    g_gfx_dim = (age_ms >= DATA_OLD_MS) ? 55 : 100;
+    /* FASE F2 + 2.12: si el dato envejece, o estamos reconectando, el
+     * contenido se apaga (el marco se queda) pero sigue siendo legible. */
+    g_gfx_dim = (g_net_busy || age_ms >= DATA_OLD_MS) ? 55 : 100;
 
     theme_effects_update(now);
 
@@ -7019,7 +7049,10 @@ static void draw_screen(uint32_t now, int requests, int data_count,
 
     gfx_frame_begin();
 
-    draw_top_bar(g_link_connected, stale, age_ms);
+    draw_top_bar(g_link_connected, stale, age_ms,
+                 d.ect_val, d.ect_valid,
+                 d.iat_val, d.iat_valid,
+                 d.volt_val, d.volt_valid);
 
     if (g_mode == MODE_QV) {
         draw_qv(&d);
@@ -7648,6 +7681,7 @@ static void run_dashboard(Target *targets, int target_count)
                 consecutive_timeouts = 0;
                 consecutive_errors = 0;
                 g_elm_stuck = 0;
+                g_try_atz = 0;
                 g_hist_count = 0;
                 g_hist_pos = 0;
                 g_hist_last = 0;
@@ -7827,8 +7861,17 @@ static void run_dashboard(Target *targets, int target_count)
                                             : "40 errores de bus");
                     }
                     log_sync();
-                    sceNetInetClose(sock);
-                    sock = -1;
+
+                    /* FASE 2.12: si el motivo es un atasco en STOPPED se
+                     * conserva el socket para probar ATZ al vencer el
+                     * backoff. En los demas cortes se cierra como antes.
+                     * En ningun caso se toca g_store: los ultimos valores
+                     * medidos deben seguir en pantalla, atenuados. */
+                    g_try_atz = (g_elm_stuck >= ELM_STUCK_RECOVER);
+                    if (!g_try_atz) {
+                        sceNetInetClose(sock);
+                        sock = -1;
+                    }
                     g_link_connected = 0;
                     memset(&rx, 0, sizeof(rx));
                     link_losses++;
@@ -7879,7 +7922,40 @@ static void run_dashboard(Target *targets, int target_count)
                 snprintf(msg, sizeof(msg), "REINTENTANDO %d/%d",
                          reconn_tries, RECONN_MAX_TRIES);
                 net_ui_set(msg);
-                sock = connect_network_and_elm(targets, &target_count, 0);
+
+                /* FASE 2.12: si el adaptador esta atascado en STOPPED,
+                 * el socket aun esta abierto. Se prueba ATZ antes de
+                 * desconectar el WiFi. connect_network_and_elm() hace
+                 * obd_store_init() y boost_init() al entrar, asi que se
+                 * guardan ambos estados por valor para no perder los
+                 * ultimos valores medidos. */
+                if (g_try_atz && sock >= 0) {
+                    obd_sample_store saved_store = g_store;
+                    boost_state saved_boost = g_boost;
+                    elm_reply r;
+                    int atz_ok = 0;
+                    g_try_atz = 0;
+                    elm_send_and_read(sock, "ATZ", 1500, &r);
+                    if (r.bytes > 0 && !r.stopped) {
+                        log_file_printf("Recuperacion: ATZ OK\n");
+                        log_sync();
+                        atz_ok = 1;
+                    } else {
+                        log_file_printf("Recuperacion: ATZ fallo -> WiFi\n");
+                        log_sync();
+                        sceNetInetClose(sock);
+                        sock = -1;
+                    }
+                    /* En los dos caminos se rehace el handshake y el
+                     * planificador, con connect_network_and_elm(). */
+                    sock = connect_network_and_elm(targets, &target_count, 0);
+                    if (sock >= 0 && atz_ok) {
+                        g_store = saved_store;
+                        g_boost = saved_boost;
+                    }
+                } else {
+                    sock = connect_network_and_elm(targets, &target_count, 0);
+                }
                 now = now_ms();
                 if (sock >= 0) {
                     reconn_active = 0;
