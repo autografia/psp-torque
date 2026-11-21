@@ -262,6 +262,23 @@ el RPM llega a **5,33 Hz** con 16,14 peticiones/s en el log mas limpio
 Pendiente: ver si con esto desaparecen los dos cortes por atasco que
 aun quedaban en 079/080.
 
+## Fase 2.11 — Cajas de datos lentos atenuadas (fase2.46)
+
+Los datos que se piden poco (aceite y combustible cada 10 s, baro cada
+30 s) desaparecian de la rejilla: `sample_value()` descartaba cualquier
+muestra de mas de 6 s y las cajas invalidas se compactaban.
+
+- [x] **TTL por PID**: los PID con periodo base de 5 s o mas viven 3
+  periodos (30 s para aceite/combustible, 90 s para baro). Los rapidos
+  conservan el corte de 6 s para que un corte de enlace no dibuje una
+  linea plana larga en las graficas de telemetria.
+- [x] **Atenuacion en vez de ocultar**: las cajas con datos viejos se
+  dibujan al 55% de intensidad, legibles, en lugar de desaparecer. El
+  umbral de atenuacion es el doble del periodo (minimo 3 s) para que
+  las cajas rapidas no parpadeen entre claro y oscuro.
+- [x] Aplicado a las rejillas MOTOR y DIAG (STFT, LTFT, avance, O2, MIL,
+  voltaje, combustible) y a todas sus cajas.
+
 ## Fase 3 — Parámetros específicos Alfa Romeo (investigación)
 
 Tareas:

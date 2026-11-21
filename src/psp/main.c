@@ -60,7 +60,7 @@ PSP_HEAP_SIZE_KB(4096);
 #define DEFAULT_HOST "192.168.0.10"
 #define DEFAULT_PORT 35000
 #define MAX_TARGETS 4
-#define BUILD_TAG "fase2.45 2026-11-21 ventana de STOPPED y ancla del hueco corregida"
+#define BUILD_TAG "fase2.46 2026-11-21 cajas lentas atenuadas en vez de ocultas"
 #define CMD_TIMEOUT_MS 500
 /* Si el adaptador ha demostrado que envia el prompt '>', hay que esperarlo
  * antes de mandar el siguiente comando. El ELM327 hace tareas internas
@@ -1110,13 +1110,60 @@ static void fmt_1(char *buf, size_t size, float value)
              scaled / 10, scaled % 10);
 }
 
+/* TTL de cada PID. Solo los PIDs LENTOS (periodo base de 5 s o mas:
+ * aceite, combustible, baro) necesitan un TTL largo: si se piden cada
+ * 10-30 s y se descartan a los 6 s, nunca aparecen en la rejilla.
+ *
+ * Los PID rapidos conservan el corte de 6 s de siempre: asi una perdida
+ * de enlace no dibuja 15 s de linea plana con datos viejos en las
+ * graficas de telemetria (la regla del proyecto es no unir huecos). */
+#define SAMPLE_TTL_MIN_MS 6000u
+
+static uint32_t sample_ttl_ms(uint8_t pid)
+{
+    uint16_t period = obd_profile_base_period(pid);
+    if (period >= 5000) {
+        return (uint32_t)period * 3u;
+    }
+    return SAMPLE_TTL_MIN_MS;
+}
+
+/* Edad de la muestra de un PID, en ms. 0xFFFFFFFF si nunca se recibio. */
+static uint32_t sample_age_ms(uint8_t pid, uint32_t now)
+{
+    const obd_sample *s = obd_store_get(&g_store, pid);
+    if (s == NULL || !s->valid) {
+        return 0xFFFFFFFFu;
+    }
+    return (uint32_t)(now - s->ts_ms);
+}
+
+/* Color de una caja: si el dato es mas viejo que el doble de su
+ * periodo, se atenua para que se vea que no es actual, pero SIGUE
+ * siendo legible. Antes esos datos se quitaban de la rejilla. */
+static uint32_t tile_color(uint8_t pid, uint32_t now, uint32_t color)
+{
+    uint16_t period = obd_profile_base_period(pid);
+    if (period == 0) {
+        period = 1000;
+    }
+    uint32_t dim_after = (uint32_t)period * 2u;
+    if (dim_after < 3000u) {
+        dim_after = 3000u;   /* los rapidos no parpadean entre claro/oscuro */
+    }
+    if (sample_age_ms(pid, now) > dim_after) {
+        return gfx_shade(color, 55);
+    }
+    return color;
+}
+
 static int sample_value(uint8_t pid, uint32_t now, float *out)
 {
     const obd_sample *sample = obd_store_get(&g_store, pid);
     if (sample == NULL || !sample->valid) {
         return 0;
     }
-    if ((uint32_t)(now - sample->ts_ms) > 6000u) {
+    if ((uint32_t)(now - sample->ts_ms) > sample_ttl_ms(pid)) {
         return 0;
     }
     *out = sample->value;
@@ -5160,6 +5207,7 @@ static void draw_qv(const dash_data *d)
 
 static void draw_engine(const dash_data *d)
 {
+    uint32_t now = now_ms();
     char bval[16] = "N/D";
     if (d->boost_valid) {
         fmt_signed_2(bval, sizeof(bval),
@@ -5173,62 +5221,68 @@ static void draw_engine(const dash_data *d)
     if (g_map_supported) {
         tiles[n].label = "MAP"; tiles[n].value = d->map_valid ? d->map_kpa : "N/D";
         tiles[n].unit = units_imperial() ? "psi ABS" : "kPa ABS";
-        tiles[n].color = d->map_valid ? QV_TEXT : QV_DIM;
+        tiles[n].color = d->map_valid ? tile_color(0x0B, now, QV_TEXT) : QV_DIM;
         tiles[n].valid = d->map_valid; n++;
     } else if (g_maf_supported) {
         tiles[n].label = "MAF"; tiles[n].value = d->maf_valid ? d->maf : "N/D";
         tiles[n].unit = units_maf_name();
-        tiles[n].color = d->maf_valid ? QV_TEXT : QV_DIM;
+        tiles[n].color = d->maf_valid ? tile_color(0x10, now, QV_TEXT) : QV_DIM;
         tiles[n].valid = d->maf_valid; n++;
     }
 
     if (g_map_supported) {
         tiles[n].label = "BOOST"; tiles[n].value = bval;
         tiles[n].unit = units_press_name();
-        tiles[n].color = d->boost_valid ? QV_TEXT : QV_DIM;
+        tiles[n].color = d->boost_valid ? tile_color(0x0B, now, QV_TEXT) : QV_DIM;
         tiles[n].valid = d->boost_valid; n++;
     }
 
     tiles[n].label = "ECT"; tiles[n].value = d->ect_valid ? d->ect : "N/D";
     tiles[n].unit = units_temp_name();
-    tiles[n].color = d->ect_valid ? QV_TEXT : QV_DIM;
+    tiles[n].color = d->ect_valid ? tile_color(0x05, now, QV_TEXT) : QV_DIM;
     tiles[n].valid = d->ect_valid; n++;
 
     tiles[n].label = "IAT"; tiles[n].value = d->iat_valid ? d->iat : "N/D";
     tiles[n].unit = units_temp_name();
-    tiles[n].color = d->iat_valid ? QV_TEXT : QV_DIM;
+    tiles[n].color = d->iat_valid ? tile_color(0x0F, now, QV_TEXT) : QV_DIM;
     tiles[n].valid = d->iat_valid; n++;
 
     tiles[n].label = g_thr_label; tiles[n].value = d->thr_valid ? d->thr : "N/D";
     tiles[n].unit = "%";
-    tiles[n].color = d->thr_valid ? QV_TEXT : QV_DIM;
+    tiles[n].color = d->thr_valid ? tile_color(g_thr_pid, now, QV_TEXT) : QV_DIM;
     tiles[n].valid = d->thr_valid; n++;
 
     if (d->load_valid) {
         tiles[n].label = "LOAD"; tiles[n].value = d->load;
-        tiles[n].unit = "%"; tiles[n].color = QV_TEXT; tiles[n].valid = 1; n++;
+        tiles[n].unit = "%";
+        tiles[n].color = tile_color(0x04, now, QV_TEXT);
+        tiles[n].valid = 1; n++;
     }
 
     if (g_pedal_supported) {
         tiles[n].label = "MARIPOSA"; tiles[n].value = d->plate_valid ? d->plate : "N/D";
-        tiles[n].unit = "%"; tiles[n].color = d->plate_valid ? QV_TEXT : QV_DIM;
+        tiles[n].unit = "%";
+        tiles[n].color = d->plate_valid ? tile_color(0x0D, now, QV_TEXT) : QV_DIM;
         tiles[n].valid = d->plate_valid; n++;
     }
 
     if (g_mask3 & 0x40000000u) {
         tiles[n].label = "VOLT"; tiles[n].value = d->volt_valid ? d->volt : "N/D";
-        tiles[n].unit = "V"; tiles[n].color = d->volt_valid ? QV_TEXT : QV_DIM;
+        tiles[n].unit = "V";
+        tiles[n].color = d->volt_valid ? tile_color(0x42, now, QV_TEXT) : QV_DIM;
         tiles[n].valid = d->volt_valid; n++;
     }
 
     if (g_oil_supported && d->oil_valid) {
         tiles[n].label = "ACEITE"; tiles[n].value = d->oil;
-        tiles[n].unit = units_temp_name(); tiles[n].color = QV_TEXT; tiles[n].valid = 1; n++;
+        tiles[n].unit = units_temp_name();
+        tiles[n].color = tile_color(0x5C, now, QV_TEXT); tiles[n].valid = 1; n++;
     }
 
     if (g_fuel_supported && d->fuel_valid) {
         tiles[n].label = "COMBUSTIBLE"; tiles[n].value = d->fuel;
-        tiles[n].unit = "%"; tiles[n].color = QV_TEXT; tiles[n].valid = 1; n++;
+        tiles[n].unit = "%";
+        tiles[n].color = tile_color(0x2F, now, QV_TEXT); tiles[n].valid = 1; n++;
     }
 
     int m = 0;
@@ -5273,43 +5327,44 @@ static void draw_engine(const dash_data *d)
 
 static void draw_motor(const dash_data *d)
 {
+    uint32_t now = now_ms();
     struct { const char *label; const char *value; const char *unit;
              uint32_t color; int valid; } tiles[8];
     int n = 0;
 
     if (d->stft_valid) {
         tiles[n].label = "STFT"; tiles[n].value = d->stft;
-        tiles[n].unit = "%"; tiles[n].color = QV_TEXT; tiles[n].valid = 1; n++;
+        tiles[n].unit = "%"; tiles[n].color = tile_color(0x06, now, QV_TEXT); tiles[n].valid = 1; n++;
     }
     if (d->ltft_valid) {
         tiles[n].label = "LTFT"; tiles[n].value = d->ltft;
-        tiles[n].unit = "%"; tiles[n].color = QV_TEXT; tiles[n].valid = 1; n++;
+        tiles[n].unit = "%"; tiles[n].color = tile_color(0x07, now, QV_TEXT); tiles[n].valid = 1; n++;
     }
     if (d->timing_valid) {
         tiles[n].label = "AVANCE"; tiles[n].value = d->timing;
-        tiles[n].unit = "deg"; tiles[n].color = QV_AMBER; tiles[n].valid = 1; n++;
+        tiles[n].unit = "deg"; tiles[n].color = tile_color(0x0E, now, QV_AMBER); tiles[n].valid = 1; n++;
     }
     if (d->o2_1_valid) {
         tiles[n].label = "O2-1"; tiles[n].value = d->o2_1;
         tiles[n].unit = o2_state_str(d->o2_1_val);
-        tiles[n].color = QV_GREEN; tiles[n].valid = 1; n++;
+        tiles[n].color = tile_color(0x14, now, QV_GREEN); tiles[n].valid = 1; n++;
     }
     if (d->o2_2_valid) {
         tiles[n].label = "O2-2"; tiles[n].value = d->o2_2;
         tiles[n].unit = o2_state_str(d->o2_2_val);
-        tiles[n].color = QV_GREEN; tiles[n].valid = 1; n++;
+        tiles[n].color = tile_color(0x15, now, QV_GREEN); tiles[n].valid = 1; n++;
     }
     if (d->fuel_valid) {
         tiles[n].label = "COMBUSTIBLE"; tiles[n].value = d->fuel;
-        tiles[n].unit = "%"; tiles[n].color = QV_TEXT; tiles[n].valid = 1; n++;
+        tiles[n].unit = "%"; tiles[n].color = tile_color(0x2F, now, QV_TEXT); tiles[n].valid = 1; n++;
     }
     if (d->volt_valid) {
         tiles[n].label = "VOLT"; tiles[n].value = d->volt;
-        tiles[n].unit = "V"; tiles[n].color = QV_TEXT; tiles[n].valid = 1; n++;
+        tiles[n].unit = "V"; tiles[n].color = tile_color(0x42, now, QV_TEXT); tiles[n].valid = 1; n++;
     }
     if (d->dist_mil_valid) {
         tiles[n].label = "MIL"; tiles[n].value = d->dist_mil;
-        tiles[n].unit = "km"; tiles[n].color = QV_AMBER; tiles[n].valid = 1; n++;
+        tiles[n].unit = "km"; tiles[n].color = tile_color(0x21, now, QV_AMBER); tiles[n].valid = 1; n++;
     }
 
     if (n == 0) {
