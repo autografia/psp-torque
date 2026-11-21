@@ -241,6 +241,27 @@ Datos: `phase1_075`..`phase1_078` (19-nov), con `elm_gap=8`.
   750 `SEARCHING` con 4 cortes de enlace. La escalada por atasco ya los
   recupera, pero conviene confirmar que con el hueco arreglado bajan.
 
+## Fase 2.10 — Ventana de STOPPED y ancla del hueco (fase2.45)
+
+Datos: `phase1_079`/`phase1_080` (21-nov), `elm_gap=8`, build fase2.44.
+
+**Resultado bueno**: STOPPED baja de 2459 a 82/105, siempre 17 PIDs, y
+el RPM llega a **5,33 Hz** con 16,14 peticiones/s en el log mas limpio
+(`phase1_080`). El objetivo de 4,5 Hz esta cumplido.
+
+**Dos ajustes**:
+
+- [x] **Ancla del hueco**: `g_last_resp_ms` se marcaba incluso en una
+  respuesta STOPPED y no se reiniciaba al perder el enlace. Eso hacia que
+  el primer comando tras un corte "midiera" un hueco enorme. Ahora no se
+  ancla en STOPPED y se pone a 0 al cerrar el socket.
+- [x] **Contador de atasco en ventana deslizante**: con STOPPED
+  intercalados entre respuestas buenas, el contador consecutivo nunca
+  llegaba a 8. Ahora se cuenta en una ventana de 12 peticiones.
+
+Pendiente: ver si con esto desaparecen los dos cortes por atasco que
+aun quedaban en 079/080.
+
 ## Fase 3 — Parámetros específicos Alfa Romeo (investigación)
 
 Tareas:

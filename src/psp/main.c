@@ -60,7 +60,7 @@ PSP_HEAP_SIZE_KB(4096);
 #define DEFAULT_HOST "192.168.0.10"
 #define DEFAULT_PORT 35000
 #define MAX_TARGETS 4
-#define BUILD_TAG "fase2.44 2026-11-19 correccion: hueco real 8ms y handshake sin mascara"
+#define BUILD_TAG "fase2.45 2026-11-21 ventana de STOPPED y ancla del hueco corregida"
 #define CMD_TIMEOUT_MS 500
 /* Si el adaptador ha demostrado que envia el prompt '>', hay que esperarlo
  * antes de mandar el siguiente comando. El ELM327 hace tareas internas
@@ -158,9 +158,10 @@ static int g_link_connected = 0;
  * "error" en el parser, antes la app martilleaba al adaptador sin
  * llegar nunca a la reconexion. */
 #define ELM_STUCK_MIN 3      /* para mostrar "ELM ATASCADO" */
-#define ELM_STUCK_RECOVER 8  /* para escalar a reconexion */
+#define ELM_STUCK_RECOVER 8  /* paradas en una ventana de 12 peticiones */
 
 static int g_elm_stuck = 0;
+static int g_elm_window = 0;
 
 /* SELECT durante una conexion en curso la cancela (FASE D3). */
 static int g_connect_cancel = 0;
@@ -7684,8 +7685,13 @@ static void run_dashboard(Target *targets, int target_count)
             uint32_t t1 = now_ms();
 
             /* FASE F1: se ancla el hueco en el instante en que la
-             * respuesta se completo. */
-            g_last_resp_ms = t1;
+             * respuesta se completo, salvo que la respuesta fuese un
+             * STOPPED: en ese caso el ELM327 esta atascado y marcar el
+             * ancla aqui haria esperar 8 ms desde un comando que el
+             * adaptador ni llego a procesar. */
+            if (!reply->stopped) {
+                g_last_resp_ms = t1;
+            }
 
             last_rtt = (int)(t1 - rx_t0);
             requests++;
@@ -7709,12 +7715,21 @@ static void run_dashboard(Target *targets, int target_count)
                 consecutive_errors = 0;
             }
 
-            /* FASE F2: contador de STOPPED seguidos. El ELM327 se puede
-             * quedar pegado en ese estado y no sale ni con reintentos. */
+            /* FASE F (correccion 21-nov): contador de STOPPED en
+             * ventana deslizante. Un fallo aislado no debe descartar
+             * los anteriores: en los viajes reales aparecen STOPPED
+             * intercalados con respuestas buenas y el contador
+             * consecutivo nunca llegaba a 8. */
+            if (++g_elm_window >= 12) {
+                g_elm_window = 0;
+                if (g_elm_stuck > 0) {
+                    g_elm_stuck--;
+                }
+            }
             if (reply->stopped) {
                 g_elm_stuck++;
-            } else {
-                g_elm_stuck = 0;
+            } else if (g_elm_stuck > 0) {
+                g_elm_stuck--;
             }
 
             obd_sched_end(&g_sched, rx_idx, t1,
@@ -7765,6 +7780,7 @@ static void run_dashboard(Target *targets, int target_count)
                     consecutive_timeouts = 0;
                     consecutive_errors = 0;
                     g_elm_stuck = 0;
+                    g_last_resp_ms = 0;   /* no arrastrar el hueco tras un corte */
 
                     /* D3: en lugar de bloquear 2 s y reconectar en el
                      * sitio (congelaba la GUI y dejaba el socket en un
