@@ -290,7 +290,7 @@ muestra de mas de 6 s y las cajas invalidas se compactaban.
   el handshake sobre la misma conexión TCP y se evitan los 10-30 s del
   ciclo WiFi. El log escribe `Recuperacion: ATZ OK` o `ATZ fallo -> WiFi`
   para medirlo.
-- [x] **Aviso global en la cabecera**, visible en las cinco pestañas:
+- [x] **Aviso global en la cabecera**, visible en las siete pestañas:
   ECT ≥ 105 °C (ámbar) / ≥ 115 °C (rojo), IAT ≥ 70 °C, voltaje < 11,5 V.
   Parpadea con el VBlank y muestra `+1` si hay más de un aviso activo.
 

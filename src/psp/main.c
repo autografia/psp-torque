@@ -4513,33 +4513,29 @@ static void draw_top_bar(int connected, int stale, uint32_t age_ms,
                  (unsigned)(session_s % 60u));
     }
 
-    /* FASE 2.12: aviso global, visible en cualquier pestaña. */
+    /* FASE 2.12: aviso global, visible en cualquier pestaña. Se pone
+     * en el bloque derecho EN LUGAR del estado y el reloj: alli hay
+     * hueco (las pestañas terminan en x≈330 y el bloque derecho empieza
+     * en x≈360). Dibujarlo en x=16 tapaba GENERAL/MOTOR/DIAG. */
     obd_alert al = obd_alert_eval(ect, ect_valid, iat, iat_valid,
                                   volt, volt_valid);
-    int warn_width = 0;
-    if (al.level != OBD_ALERT_NONE) {
-        char warn[40];
-        snprintf(warn, sizeof(warn), "! %s%s", obd_alert_text(al.kind),
-                 al.more ? " +1" : "");
-        warn_width = gfx_text_width(warn, 1);
-        /* Parpadeo con el VBlank: medio segundo visible, medio oculto. */
-        if (((now_ms() / 500u) & 1u) == 0u) {
-            uint32_t wc = (al.level == OBD_ALERT_CRIT) ? QV_CRIT : QV_AMBER;
-            gfx_text(16, 8, warn, wc, 1);
-        }
+    char righttop[40];
+    uint32_t right_color = state_color;
+
+    if (al.level != OBD_ALERT_NONE &&
+        ((now_ms() / 500u) & 1u) == 0u) {
+        /* Medio segundo visible, medio oculto: el header se limpia
+         * cada frame, asi que no queda pintura antigua. */
+        snprintf(righttop, sizeof(righttop), "! %s%s",
+                 obd_alert_text(al.kind), al.more ? " +1" : "");
+        right_color = (al.level == OBD_ALERT_CRIT) ? QV_CRIT : QV_AMBER;
+    } else {
+        snprintf(righttop, sizeof(righttop), "%s  %s", state, tb);
     }
 
-    char righttop[40];
-    snprintf(righttop, sizeof(righttop), "%s  %s", state, tb);
     int right_x = GFX_W - 8 - gfx_text_width(righttop, 1);
-    if (warn_width > 0 && right_x < 16 + warn_width + 8) {
-        /* No cabe: se recorta el estado para que el aviso siempre
-         * se lea. El aviso manda. */
-        righttop[4] = '\0';
-        right_x = GFX_W - 8 - gfx_text_width(righttop, 1);
-    }
     gfx_circle((float)(right_x - 9), 12.0f, 4.0f, dot);
-    gfx_text(right_x, 8, righttop, state_color, 1);
+    gfx_text(right_x, 8, righttop, right_color, 1);
 
     g_gfx_dim = saved_dim;
 }
@@ -7744,9 +7740,13 @@ static void run_dashboard(Target *targets, int target_count)
         boost_learn_update(now);
 
         /* FASE D1 + F1: lectura OBD no bloqueante con hueco minimo. */
+        /* FASE 2.12: mientras hay una reconexion programada NO se
+         * sondea. El socket se ha reservado para el intento de ATZ y
+         * mandarle PIDs solo genera mas STOPPED que reinician el plazo
+         * del backoff (livelock: la reconexion nunca llegaba a correr). */
         int rx_ready = 0;
         int gap_pending = 0;
-        if (sock >= 0 && !g_demo) {
+        if (sock >= 0 && !g_demo && !reconn_active) {
             if (!rx.active) {
                 /* FASE F1: si el ELM327 aun no ha tenido su silencio,
                  * no se envia nada: el bucle sigue y la espera de la
@@ -7940,6 +7940,13 @@ static void run_dashboard(Target *targets, int target_count)
                         log_file_printf("Recuperacion: ATZ OK\n");
                         log_sync();
                         atz_ok = 1;
+                        /* connect_network_and_elm() abre un socket NUEVO.
+                         * Si no cerramos este, el clon (tipicamente
+                         * unico cliente) rechaza la segunda conexion y
+                         * se cae al ciclo WiFi de 10-30 s que queriamos
+                         * evitar. Ademas fugaba un fd por recuperacion. */
+                        sceNetInetClose(sock);
+                        sock = -1;
                     } else {
                         log_file_printf("Recuperacion: ATZ fallo -> WiFi\n");
                         log_sync();

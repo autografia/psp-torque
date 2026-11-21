@@ -16,7 +16,8 @@ all: run
 $(BIN): $(SRC) ../include/obd/elm327.h ../include/obd/pid.h \
         ../include/obd/boost.h ../include/obd/scheduler.h \
         ../include/obd/samples.h ../include/obd/profile.h \
-        ../include/obd/discovery.h ../include/obd/smooth.h
+        ../include/obd/discovery.h ../include/obd/smooth.h \
+        ../include/obd/alert.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
 
