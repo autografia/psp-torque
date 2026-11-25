@@ -37,15 +37,19 @@
 #include <math.h>
 #include <time.h>
 
+#include "obd/alert.h"
 #include "obd/boost.h"
 #include "obd/discovery.h"
-#include "obd/alert.h"
+#include "obd/dtc.h"
 #include "obd/elm327.h"
+#include "obd/oil.h"
 #include "obd/pid.h"
 #include "obd/profile.h"
 #include "obd/samples.h"
 #include "obd/scheduler.h"
 #include "obd/smooth.h"
+#include "obd/vehicle.h"
+#include "splash_mx5.h"
 
 #include "gfx.h"
 #include "audio.h"
@@ -54,19 +58,44 @@ PSP_MODULE_INFO("PSPTorqueOBD", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(4096);
 
-#define CONFIG_PATH "ms0:/PSP/GAME/PSPTorqueOBD/host.txt"
-#define LOG_DIR "ms0:/PSP/GAME/PSPTorqueOBD"
+/* Carpeta de datos: la convencion de la consola es SAVEDATA, y el
+ * nombre de 9 caracteres es el que usa el firmware para sus partidas
+ * (PSPTORQUE = 9). El log, los ajustes y host.txt viven aqui, no junto
+ * al EBOOT: asi el usuario puede instalar el EBOOT donde quiera. */
+#define SAVEDATA_DIR "ms0:/PSP/SAVEDATA/PSPTORQUE"
+#define LOG_DIR SAVEDATA_DIR
+#define CONFIG_PATH SAVEDATA_DIR "/host.txt"
 #define LOG_PREFIX LOG_DIR "/phase1_"
-#define SETTINGS_PATH "ms0:/PSP/GAME/PSPTorqueOBD/settings.txt"
+#define SETTINGS_PATH SAVEDATA_DIR "/settings.txt"
+#define SETTINGS_TMP_PATH SAVEDATA_DIR "/settings.tmp"
+/* Protocolo forzado, opcional: un numero (3 = ISO 9141-2, 5 = KWP
+ * init rapido, 6 = CAN 11/500, 7 = CAN 29/500). Vacio = automatico. */
+#define PROTO_PATH SAVEDATA_DIR "/protocol.txt"
+
+/* Instalaciones anteriores guardaban los datos en la carpeta del EBOOT.
+ * Se leen de ahi si todavia no hay nada en SAVEDATA, para no perder los
+ * ajustes de quien ya tenia la app instalada. */
+#define LEGACY_DIR "ms0:/PSP/GAME/PSPTorqueOBD"
+#define LEGACY_SETTINGS_PATH LEGACY_DIR "/settings.txt"
+#define LEGACY_CONFIG_PATH LEGACY_DIR "/host.txt"
 #define DEFAULT_HOST "192.168.0.10"
 #define DEFAULT_PORT 35000
 #define MAX_TARGETS 4
-#define BUILD_TAG "fase2.47 2026-11-21 reconexion sin perder datos y avisos globales"
+#define BUILD_TAG "fase2.69 2026-11-26 alert in the header, state visible, reconnects keep data"
 #define CMD_TIMEOUT_MS 500
+
+/* En K-line la vuelta de un PID se midio en 383 ms y el clon a veces pasa
+ * de 500: cortar ahi deja la respuesta sin prompt, el '>' llega cuando ya
+ * se ha enviado el comando siguiente y el adaptador contesta STOPPED. El
+ * log del 18/11/2026 tiene ocho de esos por cada 360 peticiones, cada uno
+ * con un reintento y un PID perdido. En CAN se queda en 500, que es el
+ * valor calibrado del MiTo. */
+#define CMD_TIMEOUT_KLINE_MS 1000
 /* Si el adaptador ha demostrado que envia el prompt '>', hay que esperarlo
  * antes de mandar el siguiente comando. El ELM327 hace tareas internas
  * despues de responder y, si le llega otro comando, contesta STOPPED y se
  * queda atascado. Este es el margen de seguridad si el prompt no llega. */
+#define ELM_SEARCH_WAIT_MS 20000u
 #define ELM_QUIET_MS 60
 #define ELM_PROMPT_WAIT_MS 250
 
@@ -88,6 +117,7 @@ typedef struct {
     int error;
     int unable;
     int stopped;
+    int searching;   /* el adaptador esta buscando el protocolo */
     int prompt;
     elm_frame frame;
     char text[64];
@@ -116,6 +146,22 @@ static int g_map_supported = 0;
 static int g_maf_supported = 0;
 static char g_elm[40] = "?";
 static char g_proto[32] = "?";
+
+/* FASE U3: pantalla de arranque elegida y herramientas ocultas. Van aqui
+ * arriba porque el selector las consulta antes que nada. */
+static int g_start_mode = -1;       /* -1 = la ultima pantalla (last=) */
+static uint16_t g_hidden_mask = 0;  /* bits MODE_* que no se ofrecen (son 9) */
+/* Perfil detectado en esta sesion: clave de v.<id>.* y lo que decide si
+ * la vista es de este coche o la global. */
+static char g_vehicle_id[24] = "";
+static char g_vehicle_name[24] = "";
+
+/* Estado de FALLOS: la barra mira la lampara, asi que esto vive arriba. */
+static int g_dtc_mil = -1;        /* -1 = no se ha leido */
+static int g_dtc_state = 0;       /* 0 sin leer, 1 leyendo, 2 leido */
+static int g_dtc_count = -1;
+static int g_ff_valid = 0;        /* la foto del fallo existe y se leyo */
+static int g_ff_offered = 0;      /* la ECU anuncia el modo 02 (0100) */
 static char g_vbat[24] = "?";
 static char g_ssid[32] = "";
 static char g_ip[24] = "";
@@ -124,12 +170,6 @@ static int g_elm_prompt_seen = 0;
 static float g_peak_rpm = 0.0f;
 static float g_peak_speed = 0.0f;
 static float g_peak_boost = 0.0f;
-
-/* Suavizado EMA con constante de tiempo fija (FASE E3). */
-static obd_smooth g_ema_rpm;
-static obd_smooth g_ema_map;
-static obd_smooth g_ema_speed;
-static obd_smooth g_ema_thr;
 
 /* ------------------------------------------------------------------ */
 /* Estado de la UI grafica.                                           */
@@ -144,12 +184,187 @@ static obd_smooth g_ema_thr;
 #define MODE_MODULES   4
 #define MODE_SNIFFER   5
 #define MODE_INFO      6
-#define MODE_COUNT     7
+#define MODE_PROBE     7   /* sonda del coche: solo diagnostico */
+#define MODE_FALLOS    8   /* codigos de averia, solo lectura */
+#define MODE_COUNT     9
 
 #define HIST_MAX 180
 
 static int g_mode = MODE_QV;
+static int g_last_mode = MODE_QV;    /* pantalla recordada entre sesiones */
+static int g_picker_open = 0;        /* selector de pantallas (SELECT) */
+static int g_picker_sel = 0;
+static int g_last_saved_mode = -1;  /* ultima pantalla escrita en last= */
+static uint32_t g_mode_since_ms = 0; /* cuando se cambio de pantalla */
+
+/* FASE K2: capacidad del enlace.
+ *
+ * En CAN no se mide: la tabla base ya cabe en el presupuesto y ese coche es
+ * el de regresion, asi que su comportamiento no puede depender de una
+ * medida. En K-line se parte del techo de la clase y se baja a lo medido,
+ * que es lo unico que puede hacer util un enlace de 1,9 req/s. */
+static float g_link_measured = 0.0f;    /* 0 = sin medida todavia */
+static uint16_t g_link_service_ms = 530;
+static obd_link_plan g_link_plan;
+static float g_plan_demand = 0.0f;      /* req/s que pide el plan actual */
+static uint32_t g_cap_window_ms = 0;
+static int g_cap_window_reqs = 0;
+static int g_cap_warmup = 0;   /* 1 = la primera ventana no se mide */
+static uint8_t g_prio_orig[OBD_SCHED_MAX];
+
+/* Capacidad con la que se planifica ahora mismo. */
+static float link_capacity(void)
+{
+    int cls = obd_vehicle_proto_class(g_proto);
+    float cap = obd_profile_link_class(cls);
+    if (cls == OBD_PROTO_CAN) {
+        return cap;
+    }
+    if (g_link_measured > 0.0f && g_link_measured < cap) {
+        return g_link_measured;
+    }
+    return cap;
+}
+
+static int scan_can(void);
+static const char *tr(const char *key);
 static unsigned int g_prev_buttons = 0;
+
+/* Nombre visible de cada pantalla, en la barra y en el selector. */
+static const char *mode_name(int mode)
+{
+    switch (mode) {
+    case MODE_QV:        return tr("GENERAL");
+    case MODE_ENGINE:    return tr("MOTOR");
+    case MODE_MOTOR:     return tr("DIAG");
+    case MODE_TELEMETRY: return tr("TELEM");
+    case MODE_MODULES:   return tr("MODULOS");
+    case MODE_SNIFFER:   return tr("SNIFFER");
+    case MODE_INFO:      return tr("INFO");
+    case MODE_PROBE:     return tr("SONDA");
+    case MODE_FALLOS:    return tr("FALLOS");
+    default:             return "";
+    }
+}
+
+/* Una sola linea de para que sirve cada pantalla, para el selector. */
+static const char *mode_purpose(int mode)
+{
+    switch (mode) {
+    case MODE_QV:        return tr("Dashboard principal");
+    case MODE_ENGINE:    return tr("Detalle del motor");
+    case MODE_MOTOR:     return tr("Mezcla y encendido");
+    case MODE_TELEMETRY: return tr("Series de telemetria");
+    case MODE_MODULES:   return tr("Centralitas del coche");
+    case MODE_SNIFFER:   return tr("Trafico del bus");
+    case MODE_INFO:      return tr("Que es cada dato");
+    case MODE_PROBE:     return tr("Probar un coche");
+    case MODE_FALLOS:    return tr("Codigos de averia");
+    default:             return "";
+    }
+}
+
+/* Pantallas de conduccion: las unicas que recorre L/R y las unicas que
+ * salen en la barra superior. */
+static int mode_is_driving(int mode)
+{
+    return mode == MODE_QV || mode == MODE_ENGINE ||
+           mode == MODE_MOTOR || mode == MODE_TELEMETRY;
+}
+
+/* Una pantalla que este coche no puede usar no se ofrece en la barra y
+ * sale en gris en el selector con el motivo. Mientras no se conoce el
+ * protocolo (antes de conectar) no se oculta nada. */
+static int screen_available(int mode)
+{
+    /* MODULOS funciona en las dos clases: en CAN con el sondeo UDS y en
+     * K-line con las mascaras de OBD-II, que es todo lo que hay. SNIFFER
+     * decodifica tramas CAN y en un bus K-line no tiene nada que capturar. */
+    if (mode != MODE_SNIFFER) {
+        return 1;
+    }
+    if (g_proto[0] == 0 || strcmp(g_proto, "?") == 0 ||
+        strcmp(g_proto, "A0") == 0) {
+        return 1;
+    }
+    return scan_can();
+}
+
+/* Una pantalla oculta con hidden= no se ofrece en el selector, pero sigue
+ * siendo alcanzable si es la que estaba puesta. */
+static int screen_offered(int mode)
+{
+    if (mode >= 0 && mode < MODE_COUNT && (g_hidden_mask & (1u << mode))) {
+        return 0;
+    }
+    return screen_available(mode);
+}
+
+/* Motivo por el que una pantalla no esta disponible, o cadena vacia. */
+static const char *screen_reason(int mode)
+{
+    if (screen_available(mode)) {
+        return "";
+    }
+    return tr("Solo CAN");
+}
+
+/* Orden del selector: primero lo que se usa conduciendo, despues las
+ * herramientas. */
+static const int g_picker_order[MODE_COUNT] = {
+    MODE_QV, MODE_ENGINE, MODE_MOTOR, MODE_TELEMETRY,
+    MODE_MODULES, MODE_FALLOS, MODE_SNIFFER, MODE_INFO, MODE_PROBE
+};
+
+static int picker_index_of(int mode)
+{
+    for (int i = 0; i < MODE_COUNT; i++) {
+        if (g_picker_order[i] == mode) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+/* Mueve la seleccion saltando las pantallas que este coche no tiene. */
+static int picker_step(int idx, int dir)
+{
+    for (int k = 1; k <= MODE_COUNT; k++) {
+        int ni = (idx + dir * k) % MODE_COUNT;
+        if (ni < 0) {
+            ni += MODE_COUNT;
+        }
+        if (screen_offered(g_picker_order[ni])) {
+            return ni;
+        }
+    }
+    return idx;
+}
+
+/* L/R solo recorre las pantallas de conduccion. Desde una herramienta
+ * vuelve al dashboard: pasar por SNIFFER o MODULOS sin querer, con el
+ * coche en marcha, no es aceptable. */
+static int mode_step(int mode, int dir)
+{
+    static const int driving[4] = { MODE_QV, MODE_ENGINE, MODE_MOTOR,
+                                    MODE_TELEMETRY };
+    int idx = -1;
+
+    if (!mode_is_driving(mode)) {
+        return MODE_QV;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (driving[i] == mode) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0) {
+        return MODE_QV;
+    }
+    return driving[(idx + dir + 4) % 4];
+}
+
 static int g_link_connected = 0;
 
 /* FASE F2: respuestas STOPPED seguidas del adaptador.
@@ -159,10 +374,19 @@ static int g_link_connected = 0;
  * "error" en el parser, antes la app martilleaba al adaptador sin
  * llegar nunca a la reconexion. */
 #define ELM_STUCK_MIN 3      /* para mostrar "ELM ATASCADO" */
-#define ELM_STUCK_RECOVER 8  /* paradas en una ventana de 12 peticiones */
+#define ELM_STUCK_RECOVER 8  /* paradas dentro de una ventana de 12 peticiones */
+
+/* Una racha de NO DATA es otra cosa: el adaptador esta vivo y contesta,
+ * pero la centralita se ha callado. Los bytes llegan, asi que el contador
+ * de timeouts no lo ve, y la pantalla se queda en N/D para siempre (el
+ * 18/11/2026 se vieron 55 NO DATA seguidos, con la ultima lectura buena
+ * de rpm congelada en pantalla). Solo se recupera rehaciendo el
+ * handshake, que es lo que hace el camino de reconexion. */
+#define ELM_NO_DATA_RECOVER 20
 
 static int g_elm_stuck = 0;
-static int g_elm_window = 0;
+static int g_elm_window = 0;   /* peticiones desde la ultima poda */
+static int g_no_data_streak = 0;
 
 /* SELECT durante una conexion en curso la cancela (FASE D3). */
 static int g_connect_cancel = 0;
@@ -250,7 +474,9 @@ static void scan_refresh_proto(int sock, const char *tag);
 static void run_scan(int sock);
 static void draw_modules(void);
 static void build_scheduler(void);
+static void apply_screen_schedule(uint32_t now);
 static void demo_apply_flags(int on);
+static void demo_apply_car(int on);
 static float clamp_float(float v, float lo, float hi);
 
 /* Ajustes de tema persistidos en settings.txt. */
@@ -262,7 +488,8 @@ typedef struct {
     int anim;       /* 1 = animacion de arranque */
     int fast;       /* 0 = completo, 1 = modo rapido */
     int peak_hold;  /* 1 = mostrar pico maximo */
-    int smooth;     /* 1 = suavizado de datos */
+    int needle;     /* 0 = directa, 1 = suave 150 ms, 2 = muy suave 400 ms */
+    int split_values; /* valores rapidos en pantalla: 0..4 (0 = solo RPM) */
     int shift_rpm;  /* RPM para shift light */
     int rpm_max;    /* fondo de escala del tacometro */
     int units;      /* 0 = metrico, 1 = imperial */
@@ -273,10 +500,16 @@ typedef struct {
     int chime_gap;  /* fijo 9 decimas = 0,90 s; sin ajuste */
     int show_fps;   /* 1 = mostrar FPS en pantalla */
     int debug;      /* 1 = panel de diagnostico de rendimiento */
+    int log;        /* 0 = sin archivo, 1 = sesion, 2 = completa */
+    char profile[24]; /* perfil forzado (vehicle.h); vacio = autodetectar */
 } app_settings;
 
-static app_settings g_cfg = { 0, 0, 0, 1, 1, 0, 1, 0,
-                              4000, 7000, 0, 1, 0, 15, 100, 9, 1, 0 };
+static app_settings g_cfg = { 0, 0, 0, 1, 1, 0, 1, 1, 3,
+                              4000, 7000, 0, 1, 0, 15, 100, 9, 1, 0, 2, "" };
+
+/* Lineas que settings_load() no puede escribir todavia: corre antes que
+ * log_open(), porque el propio ajuste LOG decide si hay archivo. */
+static char g_settings_log[256];
 
 /* FASE F1: hueco minimo entre el fin de una respuesta y el envio del
  * siguiente comando al ELM327. Medido: con 0 ms el clon retrasa su
@@ -288,25 +521,103 @@ static const int g_elm_gap_values[7] = { 0, 2, 4, 6, 8, 12, 17 };
 static int g_elm_min_gap_ms = ELM_GAP_DEFAULT_MS;
 static uint32_t g_last_resp_ms = 0;   /* anclaje del hueco */
 
-/* FASE 2.12: cuando el adaptador se atasca en STOPPED se prueba un ATZ
- * sobre la conexion actual antes de tirar el WiFi. */
+/* FASE 2.12 del autor original: si el adaptador se atasca en STOPPED se
+ * conserva el socket y se prueba un ATZ sobre el antes de tirar el WiFi. */
 static int g_try_atz = 0;
+
+/* Instantanea del almacen al perder el enlace. connect_network_and_elm()
+ * limpia el almacen al entrar, asi que sin esto el primer reintento fallido
+ * dejaba los cuadros en N/D: los valores del enlace perdido se devuelven
+ * tras cada intento que no conecta (antes solo se devolvian si el ATZ
+ * contestaba, y una WiFi caida no contesta nunca). */
+static obd_sample_store g_keep_store;
+static boost_state g_keep_boost;
+
+/* Cadencia real del enlace (FASE F2b): hueco entre muestras aceptadas.
+ *
+ * Los umbrales de frescura no pueden ser fijos: en CAN un PID vuelve cada
+ * ~330 ms y 1000 ms de silencio ya es un aviso, pero en el K-line de la
+ * MX-5 cada peticion tarda 383 ms y el plan reparte quince PIDs, asi que
+ * un valor se refresca cada 1-2 s y el umbral fijo ponia el indicador a
+ * parpadear entre naranja y verde una vez por segundo, atenuando el panel
+ * entero. Se escala con el hueco medido y se deja el suelo de siempre,
+ * asi que un coche rapido no cambia de comportamiento. */
+#define DATA_OLD_MS      1000u
+#define DATA_OLD_MAX_MS  12000u
+
+static uint32_t g_sample_iv_ms = 0;   /* media movil del hueco entre muestras */
+static uint32_t g_last_sample_ms = 0;
+
+static uint32_t data_old_ms(void)
+{
+    uint32_t old = g_sample_iv_ms * 5u;
+    if (old < DATA_OLD_MS) {
+        old = DATA_OLD_MS;
+    }
+    if (old > DATA_OLD_MAX_MS) {
+        old = DATA_OLD_MAX_MS;
+    }
+    return old;
+}
+
+/* La muestra se ha aceptado: se apunta su instante para estimar el hueco.
+ * Un salto de mas de 10 s es una reconexion, no cadencia: no entra en la
+ * media. */
+static void data_note_sample(uint32_t now)
+{
+    if (g_last_sample_ms != 0 && now > g_last_sample_ms) {
+        uint32_t iv = now - g_last_sample_ms;
+        if (g_sample_iv_ms == 0) {
+            /* Primera muestra: marca la cadencia. */
+            if (iv < 10000u) {
+                g_sample_iv_ms = iv;
+            }
+        } else if (iv <= g_sample_iv_ms * 2u + 50u) {
+            /* Solo entran los huecos de cadencia. Una pausa de varios
+             * segundos (FALLOS, escaneo, menu) no es el enlace: colarla en
+             * la media dejaba los umbrales flojos un rato en un coche
+             * rapido. */
+            g_sample_iv_ms = (g_sample_iv_ms * 7u + iv) / 8u;
+        }
+    }
+    g_last_sample_ms = now;
+}
+
+/* Lo que aporta el perfil del coche (FASE U4): si esta a 0 se usa el
+ * criterio de siempre, para que un coche sin perfil no cambie nada. */
+static int g_profile_redline = 0;   /* inicio de la zona roja */
+static int g_profile_cut = 0;       /* corte de inyeccion */
+static int g_profile_tach = 0;      /* fondo de escala, o 0 = el del ajuste */
 
 static float tach_max_rpm(void)
 {
-    return (float)g_cfg.rpm_max;
+    return (float)((g_profile_tach > 0) ? g_profile_tach : g_cfg.rpm_max);
+}
+
+/* Lo que aporta el coche no se escribe en settings.txt: son hechos del
+ * vehiculo, no preferencias. Si el usuario toca el tacometro en el menu,
+ * manda el suyo hasta la proxima conexion. */
+static void vehicle_release_tacho(void)
+{
+    g_profile_tach = 0;
+    g_profile_redline = 0;
+    g_profile_cut = 0;
 }
 
 static float redline_rpm(void)
 {
+    int tach = (int)tach_max_rpm();
+    if (g_profile_redline > 0 && g_profile_redline < tach) {
+        return (float)g_profile_redline;
+    }
     /* Zona roja automatica: 500 rpm antes del fondo de escala. Con el
      * ajuste por defecto (7000) queda en 6500, como el corte habitual. */
-    int r = g_cfg.rpm_max - 500;
+    int r = tach - 500;
     if (r < 2000) {
         r = 2000;
     }
-    if (r > g_cfg.rpm_max - 200) {
-        r = g_cfg.rpm_max - 200;
+    if (r > tach - 200) {
+        r = tach - 200;
     }
     return (float)r;
 }
@@ -400,6 +711,10 @@ enum {
     W_RPM = 0, W_SPEED, W_BOOST, W_ECT, W_IAT, W_MAP, W_MAF,
     W_THR, W_LOAD, W_PLATE, W_VOLT, W_OIL, W_FUEL,
     W_STFT, W_LTFT, W_TIMING, W_O2_1, W_O2_2, W_DIST_MIL, W_BARO,
+    W_GEAR,
+    /* Bloque del GENERAL de la MX-5: aire (MAF), presion de aceite
+     * calculada y agua, en una sola casilla estrecha. */
+    W_AUX,
     W_COUNT
 };
 #define W_OFF (-1)
@@ -412,8 +727,19 @@ enum { STYLE_GAUGE = 0, STYLE_BAR, STYLE_TEXT, STYLE_OFF, STYLE_COUNT };
 static const char *const g_widget_names[W_COUNT] = {
     "RPM", "VELOCIDAD", "BOOST", "ECT", "IAT", "MAP", "MAF",
     "ACELERADOR", "CARGA", "MARIPOSA", "VOLT", "ACEITE", "COMBUSTIBLE",
-    "STFT", "LTFT", "AVANCE", "O2-1", "O2-2", "MIL", "BARO"
+    "STFT", "LTFT", "AVANCE", "O2-1", "O2-2", "MIL", "BARO", "MARCHA",
+    "BLOQUE"
 };
+
+/* Nombre visible de cada dato: pasa por tr() para que el dashboard siga el
+ * idioma como el resto de la interfaz. */
+static const char *widget_name(int item)
+{
+    if (item < 0 || item >= W_COUNT) {
+        return "";
+    }
+    return tr(g_widget_names[item]);
+}
 
 static const char *const g_style_names[STYLE_COUNT] = {
     "RELOJ", "BARRA", "TEXTO", "OCULTO"
@@ -429,8 +755,301 @@ static int g_slot_style[DASH_SLOTS] = {
 };
 
 static int g_tel_item[TEL_SLOTS] = {
-    W_RPM, W_BOOST, W_ECT, W_SPEED, W_OFF
+    W_RPM, W_BOOST, W_TIMING, W_THR, W_OFF
 };
+
+/* FASE U4b: lo que el coche puede o no llenar.
+ *
+ * La vista no se toca ni se guarda: g_slot_item sigue siendo la del
+ * usuario y settings.txt escribe esa. Lo unico que cambia es lo que se
+ * PINTA: si el coche no tiene MAP, los huecos que iban de BOOST y de MAP
+ * ensenan MAF y carga en vez de dos N/D. En cuanto el usuario toca la
+ * vista a mano manda la suya y el coche no opina. */
+static int g_vehicle_centre = OBD_CENTRE_BOOST;
+static int g_layout_user = 0;        /* 1 = el usuario ha tocado la vista */
+static int g_layout_dirty = 0;       /* 1 = la ha tocado EN ESTA sesion */
+
+/* FASE U3: preferencias v2.
+ *
+ * Tres cosas que van por coche o por persona y no por sesion:
+ *   - la vista de cada coche (v.<id>.slotN_item / telN_item), para que
+ *     ordenarla en la MX-5 no descoloque el MiTo;
+ *   - la pantalla de arranque (start=), un nombre o "last";
+ *   - las herramientas que no se usan (hidden=), que no salen en el
+ *     selector.
+ * Un fichero viejo sigue valiendo: lo que no aparece se queda como esta. */
+#define VEHICLE_PREFS_MAX 4
+
+typedef struct {
+    char id[24];
+    int has_layout;
+    int slot_item[DASH_SLOTS];
+    int slot_style[DASH_SLOTS];
+    int tel_item[TEL_SLOTS];
+    int has_tacho;
+    int rpm_max;
+    int shift_rpm;
+} vehicle_prefs;
+
+
+static vehicle_prefs g_car_prefs[VEHICLE_PREFS_MAX];
+static int g_car_prefs_count = 0;
+
+/* La vista global tal cual viene del fichero, para poder volver a ella
+ * cuando el coche no trae la suya. */
+static int g_global_slot_item[DASH_SLOTS];
+static int g_global_slot_style[DASH_SLOTS];
+static int g_global_tel_item[TEL_SLOTS];
+
+/* La escala de fabrica sin coche: la que se escribe en la clave global
+ * y a la que se vuelve al cambiar de coche. */
+static int g_global_rpm_max = 7000;
+
+static int slot_item_eff(int i)
+{
+    if (i < 0 || i >= DASH_SLOTS) {
+        return W_OFF;
+    }
+
+    /* Lo que el coche dice de si mismo manda sobre la vista de fabrica.
+     * En un coche sin MAP el hueco del centro pasa a ser el bloque de
+     * aire/aceite/agua, el de la temperatura el de la marcha y el del MAP
+     * el del avance. */
+    if (!g_layout_user && g_vehicle_centre == OBD_CENTRE_MAF) {
+        if (i == 2) {
+            return W_AUX;
+        }
+        if (i == 3) {
+            return W_GEAR;
+        }
+        if (i == 5) {
+            /* Avance de encendido donde un coche con turbo veria el MAP:
+             * ivan lo sigue en conduccion y la carga no le dice nada. */
+            return W_TIMING;
+        }
+    } else if (!g_layout_user && g_vehicle_centre == OBD_CENTRE_LOAD) {
+        if (i == 2) {
+            return W_LOAD;
+        }
+        if (i == 5) {
+            return W_MAF;
+        }
+    }
+
+    /* Regla de sensor, valida con cualquier vista: en un coche sin MAP un
+     * cuadro de BOOST o de MAP no puede ensenar una lectura inventada.
+     * Antes esto solo se aplicaba a la vista de fabrica, asi que en cuanto
+     * la tarjeta guardaba la vista del coche volvia a salir el BOOST. */
+    int item = g_slot_item[i];
+    if (g_mask1 != 0 && !g_map_supported) {
+        /* Con mascaras leidas y sin MAP: el coche no tiene ese sensor. Sin
+         * mascaras (arranque, sin coche) no se sustituye nada, que si no el
+         * MiTo perdia su BOOST durante todo el handshake. */
+        if (item == W_BOOST) {
+            return g_maf_supported ? W_MAF : W_OFF;
+        }
+        if (item == W_MAP) {
+            return W_TIMING;
+        }
+    }
+    return item;
+}
+
+/* El estilo acompana al hueco cuando el coche lo cambia. */
+static int slot_style_eff(int i)
+{
+    if (i < 0 || i >= DASH_SLOTS) {
+        return STYLE_OFF;
+    }
+    /* Un hueco oculto sigue oculto aunque el coche cambie su dato. */
+    if (g_slot_style[i] == STYLE_OFF) {
+        return STYLE_OFF;
+    }
+    if (slot_item_eff(i) == W_AUX) {
+        return STYLE_TEXT;
+    }
+    if (slot_item_eff(i) != g_slot_item[i]) {
+        /* Lo que el coche pone en el hueco se pinta como texto, salvo la
+         * carga, que es una barra como el boost al que sustituye. */
+        return (slot_item_eff(i) == W_LOAD) ? STYLE_BAR : STYLE_TEXT;
+    }
+    return g_slot_style[i];
+}
+
+/* La serie de telemetria que pintaba boost en el grafico. */
+static int tel_item_eff(int i)
+{
+    if (i < 0 || i >= TEL_SLOTS) {
+        return W_OFF;
+    }
+    if (!g_layout_user && g_tel_item[i] == W_BOOST) {
+        if (g_vehicle_centre == OBD_CENTRE_MAF) {
+            return W_MAF;
+        }
+        if (g_vehicle_centre == OBD_CENTRE_LOAD) {
+            return W_LOAD;
+        }
+    }
+    return g_tel_item[i];
+}
+
+/* 1 mientras la vista sea la de fabrica: es lo unico que el perfil del
+ * coche puede sustituir. En cuanto el usuario cambia un hueco, su vista
+ * manda y no se toca ni al cambiar de coche. */
+static int layout_is_factory(void)
+{
+    static const int fit[DASH_SLOTS] = { W_RPM, W_SPEED, W_BOOST,
+                                         W_ECT, W_IAT, W_MAP };
+    static const int fit_style[DASH_SLOTS] = { STYLE_GAUGE, STYLE_GAUGE,
+                                               STYLE_BAR, STYLE_TEXT,
+                                               STYLE_TEXT, STYLE_TEXT };
+    /* Dos juegos validos para las series: el de siempre y el que paso a
+     * ser el defecto en fase2.58 (avance y mariposa). Hace falta aceptar
+     * los dos: una tarjeta que ya tenga el viejo guardado no puede perder
+     * la vista de fabrica, porque es la que hace que el perfil del coche
+     * cambie MAP por MAF, MARCHA y AVANCE. */
+    static const int fit_tel[TEL_SLOTS] = { W_RPM, W_BOOST, W_TIMING,
+                                            W_THR, W_OFF };
+    static const int fit_tel_old[TEL_SLOTS] = { W_RPM, W_BOOST, W_ECT,
+                                                W_SPEED, W_OFF };
+    for (int i = 0; i < DASH_SLOTS; i++) {
+        if (g_slot_item[i] != fit[i] || g_slot_style[i] != fit_style[i]) {
+            return 0;
+        }
+    }
+    {
+        /* Juego completo: comparar indice a indice aceptaba mezclas de los
+         * dos, y una vista a medias se tomaba por la de fabrica. */
+        int new_ok = 1;
+        int old_ok = 1;
+        for (int i = 0; i < TEL_SLOTS; i++) {
+            if (g_tel_item[i] != fit_tel[i]) {
+                new_ok = 0;
+            }
+            if (g_tel_item[i] != fit_tel_old[i]) {
+                old_ok = 0;
+            }
+        }
+        if (!new_ok && !old_ok) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Preferencias de un coche por id; con 'create' se dan de alta. */
+static vehicle_prefs *car_prefs_for(const char *id, int create)
+{
+    if (id == NULL || id[0] == '\0') {
+        return NULL;
+    }
+    for (int i = 0; i < g_car_prefs_count; i++) {
+        if (strcmp(g_car_prefs[i].id, id) == 0) {
+            return &g_car_prefs[i];
+        }
+    }
+    if (!create || g_car_prefs_count >= VEHICLE_PREFS_MAX) {
+        return NULL;
+    }
+    vehicle_prefs *p = &g_car_prefs[g_car_prefs_count++];
+    memset(p, 0, sizeof(*p));
+    snprintf(p->id, sizeof(p->id), "%s", id);
+    return p;
+}
+
+/* Guarda la vista global y pone la del coche, si la tiene. */
+static void layout_apply_for_car(void)
+{
+    memcpy(g_slot_item, g_global_slot_item, sizeof(g_slot_item));
+    memcpy(g_slot_style, g_global_slot_style, sizeof(g_slot_style));
+    memcpy(g_tel_item, g_global_tel_item, sizeof(g_tel_item));
+
+    /* Primero la escala global; luego, si este coche tiene la suya, manda
+     * la suya y el perfil se aparta: el usuario la ajusto a mano. */
+    g_cfg.rpm_max = g_global_rpm_max;
+
+    vehicle_prefs *p = car_prefs_for(g_vehicle_id, 0);
+    if (p != NULL && p->has_tacho) {
+        int v = p->rpm_max;
+        if (v < 4000) {
+            v = 4000;
+        }
+        if (v > 9000) {
+            v = 9000;
+        }
+        g_cfg.rpm_max = v;
+        g_profile_tach = 0;
+    }
+    if (g_cfg.shift_rpm > g_cfg.rpm_max) {
+        g_cfg.shift_rpm = g_cfg.rpm_max;
+    }
+
+    if (p != NULL && p->has_layout) {
+        memcpy(g_slot_item, p->slot_item, sizeof(g_slot_item));
+        memcpy(g_slot_style, p->slot_style, sizeof(g_slot_style));
+        memcpy(g_tel_item, p->tel_item, sizeof(g_tel_item));
+        /* El bloque del coche pudo guardarse antes de fase2.58 con el juego
+         * viejo dentro, aunque el usuario no tocase las series: prefs_capture
+         * copia el array entero en cualquier edicion de la vista. Se migra
+         * aqui tambien, con la misma regla exacta. */
+        {
+            static const int old_tel[TEL_SLOTS] = { W_RPM, W_BOOST, W_ECT,
+                                                    W_SPEED, W_OFF };
+            static const int new_tel[TEL_SLOTS] = { W_RPM, W_BOOST,
+                                                    W_TIMING, W_THR,
+                                                    W_OFF };
+            int is_old = 1;
+            for (int i = 0; i < TEL_SLOTS; i++) {
+                if (g_tel_item[i] != old_tel[i]) {
+                    is_old = 0;
+                }
+            }
+            if (is_old) {
+                for (int i = 0; i < TEL_SLOTS; i++) {
+                    g_tel_item[i] = new_tel[i];
+                    p->tel_item[i] = new_tel[i];
+                }
+            }
+        }
+        /* fase2.66: el GENERAL de la MX-5 cambia el hueco 1 (dial de
+         * velocidad estrecho) y el 2 (bloque de aire/aceite/agua). Un
+         * bloque guardado con el juego de fabrica viejo se migra; uno
+         * tocado a mano se respeta. */
+        if (g_vehicle_centre == OBD_CENTRE_MAF) {
+            static const int old_qv[DASH_SLOTS] = { W_RPM, W_SPEED, W_BOOST,
+                                                    W_ECT, W_IAT, W_MAP };
+            static const int new_qv[DASH_SLOTS] = { W_RPM, W_SPEED, W_AUX,
+                                                    W_GEAR, W_IAT, W_TIMING };
+            static const int new_st[DASH_SLOTS] = { STYLE_GAUGE,
+                                                    STYLE_GAUGE, STYLE_TEXT,
+                                                    STYLE_TEXT, STYLE_TEXT,
+                                                    STYLE_TEXT };
+            static const int old_st[DASH_SLOTS] = { STYLE_GAUGE,
+                                                    STYLE_GAUGE, STYLE_BAR,
+                                                    STYLE_TEXT, STYLE_TEXT,
+                                                    STYLE_TEXT };
+            int is_old = 1;
+            for (int i = 0; i < DASH_SLOTS; i++) {
+                if (g_slot_item[i] != old_qv[i] ||
+                    g_slot_style[i] != old_st[i]) {
+                    is_old = 0;
+                }
+            }
+            if (is_old) {
+                for (int i = 0; i < DASH_SLOTS; i++) {
+                    g_slot_item[i] = new_qv[i];
+                    g_slot_style[i] = new_st[i];
+                    p->slot_item[i] = new_qv[i];
+                    p->slot_style[i] = new_st[i];
+                }
+            }
+        }
+        /* La vista es de este coche: el overlay por capacidad no opina. */
+        g_layout_user = 1;
+    } else {
+        g_layout_user = !layout_is_factory();
+    }
+}
 
 static int g_edit_open = 0;
 static int g_edit_sel = 0;
@@ -486,8 +1105,65 @@ static const char *tr(const char *key)
         { "CERRAR APP", "CLOSE APP" },
         { "ARRIBA/ABAJO: ELEGIR   IZQ/DER: CAMBIAR",
           "UP/DOWN: SELECT   LEFT/RIGHT: CHANGE" },
-        { "X: GUARDAR   CIRCLE: BORRAR TURBO   START: SALIR",
-          "X: SAVE   CIRCLE: CLEAR TURBO   START: EXIT" },
+        { "PANTALLAS", "SCREENS" },
+        { "HERRAMIENTAS", "TOOLS" },
+        { "L/R: VOLVER", "L/R: BACK" },
+        { "X: ABRIR   SELECT: CERRAR", "X: OPEN   SELECT: CLOSE" },
+        { "Dashboard principal", "Main dashboard" },
+        { "Detalle del motor", "Engine detail" },
+        { "Mezcla y encendido", "Mixture and ignition" },
+        { "Series de telemetria", "Telemetry traces" },
+        { "Centralitas del coche", "ECU discovery" },
+        { "Trafico del bus", "Bus capture" },
+        { "Que es cada dato", "What each value is" },
+        { "Probar un coche", "Try a car" },
+        { "Solo CAN", "CAN only" },
+        { "K-line: pendiente", "K-line: pending" },
+        { "ACTUAL", "CURRENT" },
+        { "PANTALLA INICIAL", "START SCREEN" },
+        { "VELOCIDAD", "SPEED" },
+        { "MARIPOSA", "THROTTLE" },
+        { "ACELERADOR", "ACCELERATOR" },
+        { "CARGA", "LOAD" },
+        { "ACEITE", "OIL" },
+        { "COMBUSTIBLE", "FUEL" },
+        { "AVANCE", "TIMING" },
+        { "MARCHA", "GEAR" },
+        { "TACOMETRO", "TACHO" },
+        { "TELEMETRIA", "TELEMETRY" },
+        { "Sin datos del motor.", "No engine data." },
+        { "Sin datos avanzados soportados.", "No advanced data supported." },
+        { "Comprueba el contacto y la conexion.", "Check the ignition and the connection." },
+        { "X: ELEGIR SERIES", "X: CHOOSE SERIES" },
+        { "EDITAR VISTA", "EDIT LAYOUT" },
+        { "SERIES DE TELEMETRIA", "TELEMETRY SERIES" },
+        { "SONDA DEL COCHE", "CAR PROBE" },
+        { "PULSA X PARA SONDEAR EL COCHE.", "PRESS X TO PROBE THE CAR." },
+        { "ULTIMA", "LAST" },
+        { "FALLOS", "FAULTS" },
+        { "CONGELADO", "FREEZE FRAME" },
+        { "SIN MODO 02", "NO MODE 02" },
+        { "X: GUARDAR  START: CERRAR  MANTENER START: SALIR",
+          "X: SAVE  START: CLOSE  HOLD START: EXIT" },
+        { "SESION", "SESSION" },
+        { "AGUJA", "NEEDLE" },
+        { "REPARTO", "SPLIT" },
+        { "DIRECTA", "DIRECT" },
+        { "SUAVE", "SOFT" },
+        { "MUY SUAVE", "VERY SOFT" },
+        { "SIN CUPO", "NO QUOTA" },
+        { "VALOR", "VALUE" },
+        { "VALORES", "VALUES" },
+        { "Codigos de averia", "Fault codes" },
+        { "GUARDADOS", "STORED" },
+        { "PENDIENTES", "PENDING" },
+        { "PERMANENTES", "PERMANENT" },
+        { "SIN CODIGOS", "NO CODES" },
+        { "LAMPARA", "LAMP" },
+        { "X: LEER   CIRCLE: LIMPIAR PANTALLA",
+          "X: READ   CIRCLE: CLEAR SCREEN" },
+        { "SI", "ON" },
+        { "NO", "OFF" },
     };
     if (g_lang == 0 || key == NULL) {
         return key;
@@ -500,12 +1176,20 @@ static const char *tr(const char *key)
     return key;
 }
 
-#define SET_COUNT 17
-#define SET_EXIT  16
+#define SET_COUNT 21
+#define SET_NEEDLE 18
+#define SET_SPLIT  19
+#define SET_EXIT   20
 
 static int g_settings_open = 0;
 static int g_settings_sel = 0;
 static int g_exit_request = 0;
+
+/* START mantenido para salir. Vive fuera del bucle del cuadro porque las
+ * pantallas con bucle propio (sniffer) y las esperas bloqueantes del
+ * ELM327 no vuelven al bucle hasta terminar, y ahi es justo donde el
+ * usuario concluye que la app se ha colgado. */
+static void exit_hold_tick(uint32_t now, unsigned int buttons);
 
 /* Estado grafico y de conexion en segundo plano. */
 static int g_gfx_active = 0;
@@ -552,6 +1236,17 @@ static int g_hist_pos = 0;
 static int g_hist_count = 0;
 static unsigned int g_hist_last = 0;
 
+/* Reinicio completo del historial: contadores y marcas de validez. Sin las
+ * marcas, series_stats sigue viendo las 180 casillas viejas y las casillas
+ * de MAX/MIN ensenan los extremos de la sesion anterior. */
+static void hist_reset(void)
+{
+    g_hist_count = 0;
+    g_hist_pos = 0;
+    g_hist_last = 0;
+    memset(g_hist_valid, 0, sizeof(g_hist_valid));
+}
+
 static uint32_t now_ms(void)
 {
     return (uint32_t)(sceKernelGetSystemTimeWide() / 1000);
@@ -567,6 +1262,9 @@ static void connect_yield(void);
 
 /* Scheduler; se define mas abajo. */
 static void build_scheduler(void);
+
+/* Estado del suavizado de presentacion; se define mas abajo. */
+static void disp_reset(void);
 
 /* ------------------------------------------------------------------ */
 /* Log: pantalla + archivo, con sincronizacion periodica.              */
@@ -619,14 +1317,21 @@ static void log_pick_path(void)
     }
 }
 
+static int g_log_broken = 0;
+
 static void log_open(void)
 {
     g_log_path[0] = '\0';
+    if (g_cfg.log <= 0) {
+        /* Sin archivo a proposito: no hay aviso de SIN LOG que dar. */
+        return;
+    }
     log_pick_path();
     g_log_fd = sceIoOpen(g_log_path,
                          PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC,
                          0777);
     g_log_dirty = 0;
+    g_log_broken = (g_log_fd < 0);
 }
 
 static void log_flush(void);
@@ -658,7 +1363,7 @@ static void log_sync(void)
         if (g_log_dirty) {
             uint32_t now = now_ms();
             if (g_log_last_sync_ms == 0 ||
-                (uint32_t)(now - g_log_last_sync_ms) >= 30000u) {
+                (uint32_t)(now - g_log_last_sync_ms) >= 2000u) {
                 sceIoSync("ms0:", 0);
                 g_log_dirty = 0;
                 g_log_last_sync_ms = now;
@@ -730,7 +1435,6 @@ static char *trim_in_place(char *s)
 
 static void settings_apply(void)
 {
-    g_cfg.smooth = 1;   /* suavizado siempre activo */
     /* Idioma efectivo. */
     if (g_cfg.lang == 0) {
         g_lang = (g_psp_lang == PSP_SYSTEMPARAM_LANGUAGE_SPANISH) ? 0 : 1;
@@ -741,15 +1445,17 @@ static void settings_apply(void)
     int preset = (g_cfg.theme == 0) ? g_cfg.color : g_cfg.theme;
     gfx_theme_apply(preset, g_cfg.contrast);
     audio_set_gap_ms(g_cfg.chime_gap * 100);
-    if (!g_cfg.smooth) {
-        obd_smooth_reset(&g_ema_rpm);
-        obd_smooth_reset(&g_ema_map);
-        obd_smooth_reset(&g_ema_speed);
-        obd_smooth_reset(&g_ema_thr);
-    }
+    /* Al cambiar el ajuste, el valor presentado no puede quedarse a medio
+     * camino del anterior. */
+    disp_reset();
     if (g_link_connected) {
+        /* build_scheduler vuelve a montar la tabla (todo pendiente) y
+         * termina repartiendo con el plan de la pantalla activa, asi que un
+         * cambio de ajuste (AGUJA, REPARTO, tema) llega al enlace en el
+         * acto. No se usa obd_sched_reset_due: marcaria tambien como
+         * pendientes los PID que no estan en pantalla y su primer turno se
+         * comeria el enlace que necesita el RPM. */
         build_scheduler();
-        obd_sched_reset_due(&g_sched, now_ms());
     }
     if (g_demo) {
         demo_apply_flags(1);
@@ -765,6 +1471,246 @@ static void settings_apply(void)
     g_fx_skill_until = 0;
 }
 
+/* Protocolo forzado desde protocol.txt. 0 = automatico. */
+static int g_proto_force = 0;
+
+static void proto_load(void)
+{
+    char buf[16];
+    SceUID fd = sceIoOpen(PROTO_PATH, PSP_O_RDONLY, 0777);
+
+    if (fd < 0) {
+        return;
+    }
+    int n = sceIoRead(fd, buf, sizeof(buf) - 1);
+    sceIoClose(fd);
+    if (n <= 0) {
+        return;
+    }
+    buf[n] = '\0';
+    int v = atoi(buf);
+    if (v == 3 || v == 5 || v == 6 || v == 7 || v == 8 || v == 9) {
+        g_proto_force = v;
+        log_file_printf("Protocolo forzado: %d\n", v);
+    }
+}
+
+/* Comparacion sin distinguir mayusculas, para nombres de pantalla. */
+static int name_matches(const char *a, const char *b)
+{
+    while (*a != '\0' || *b != '\0') {
+        char ca = *a;
+        char cb = *b;
+        if (ca >= 'a' && ca <= 'z') {
+            ca = (char)(ca - 'a' + 'A');
+        }
+        if (cb >= 'a' && cb <= 'z') {
+            cb = (char)(cb - 'a' + 'A');
+        }
+        if (ca != cb) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return 1;
+}
+
+/* Nombre canonico de cada pantalla, el que se escribe en el fichero. No
+ * pasa por tr(): si se guardase el nombre traducido, un fichero escrito
+ * en ingles no se entenderia al arrancar en espanol, que es justo cuando
+ * se lee g_lang todavia sin resolver. */
+static const char *mode_key(int mode)
+{
+    switch (mode) {
+    case MODE_QV:        return "GENERAL";
+    case MODE_ENGINE:    return "MOTOR";
+    case MODE_MOTOR:     return "DIAG";
+    case MODE_TELEMETRY: return "TELEM";
+    case MODE_MODULES:   return "MODULOS";
+    case MODE_SNIFFER:   return "SNIFFER";
+    case MODE_INFO:      return "INFO";
+    case MODE_PROBE:     return "SONDA";
+    case MODE_FALLOS:    return "FALLOS";
+    default:             return "";
+    }
+}
+
+/* Nombre de pantalla a modo. Acepta los nombres que se ven en la barra y
+ * tambien el numero, que es lo que escribe el propio programa. */
+static int mode_from_name(const char *name)
+{
+    if (name == NULL || name[0] == '\0') {
+        return -1;
+    }
+    if (name[0] >= '0' && name[1] == '\0') {
+        int m = name[0] - '0';
+        return (m >= 0 && m < MODE_COUNT) ? m : -1;
+    }
+    /* Se aceptan los dos idiomas: un fichero escrito por una version que
+     * guardaba el nombre traducido tiene que seguir leyendose. */
+    static const char *const en[MODE_COUNT] = {
+        "GENERAL", "ENGINE", "DIAG", "TELEM", "MODULES", "SNIFFER",
+        "INFO", "PROBE", "FAULTS"
+    };
+    for (int m = 0; m < MODE_COUNT; m++) {
+        if (name_matches(mode_key(m), name) || name_matches(en[m], name)) {
+            return m;
+        }
+    }
+    if (strcmp(name, "last") == 0 || strcmp(name, "ultima") == 0) {
+        return -1;
+    }
+    return -1;
+}
+
+/* "hidden=SNIFFER,SONDA" -> mascara de modos. */
+static uint16_t mode_hidden_parse(const char *val)
+{
+    uint16_t mask = 0;
+    char buf[96];
+    snprintf(buf, sizeof(buf), "%s", val);
+
+    char *p = buf;
+    while (*p != '\0') {
+        while (*p == ',' || *p == ' ' || *p == ';') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        char *start = p;
+        while (*p != '\0' && *p != ',' && *p != ' ' && *p != ';') {
+            p++;
+        }
+        char saved = *p;
+        *p = '\0';
+        int m = mode_from_name(start);
+        if (m >= 0 && m < MODE_COUNT) {
+            mask = (uint16_t)(mask | (1u << m));
+        }
+        if (saved == '\0') {
+            break;
+        }
+        p++;
+    }
+    return mask;
+}
+
+/* v.<id>.<clave>=valor */
+static void prefs_parse_key(const char *key, const char *val)
+{
+    char id[24];
+    const char *rest = strchr(key + 2, '.');
+    if (rest == NULL) {
+        return;
+    }
+    size_t idlen = (size_t)(rest - (key + 2));
+    if (idlen == 0 || idlen >= sizeof(id)) {
+        return;
+    }
+    memcpy(id, key + 2, idlen);
+    id[idlen] = '\0';
+
+    vehicle_prefs *vp = car_prefs_for(id, 1);
+    if (vp == NULL) {
+        return;
+    }
+    const char *sk = rest + 1;
+
+    if (strncmp(sk, "slot", 4) == 0 && sk[4] >= '0' && sk[4] <= '5') {
+        int si = sk[4] - '0';
+        int v = atoi(val);
+        /* Un fichero se puede editar a mano: se valida igual que las
+         * claves globales, o un 999 acaba indexando fuera de la tabla de
+         * nombres al pintar el editor. */
+        if (strcmp(sk + 5, "_item") == 0) {
+            if (v < 0 || v >= W_COUNT) {
+                v = W_RPM;
+            }
+            vp->slot_item[si] = v;
+            vp->has_layout = 1;
+        } else if (strcmp(sk + 5, "_style") == 0) {
+            if (v < 0 || v >= STYLE_COUNT) {
+                v = STYLE_TEXT;
+            }
+            vp->slot_style[si] = v;
+            vp->has_layout = 1;
+        }
+    } else if (strncmp(sk, "tel", 3) == 0 && sk[3] >= '0' && sk[3] <= '4') {
+        int ti = sk[3] - '0';
+        int v = atoi(val);
+        if (strcmp(sk + 4, "_item") == 0) {
+            if (v < W_OFF || v >= W_COUNT) {
+                v = W_OFF;
+            }
+            vp->tel_item[ti] = v;
+            vp->has_layout = 1;
+        }
+    } else if (strcmp(sk, "rpm_max") == 0) {
+        vp->rpm_max = atoi(val);
+        vp->has_tacho = 1;
+    }
+}
+
+/* Nombres de las pantallas ocultas, para escribir hidden=. */
+static const char *hidden_names_join(void)
+{
+    static char buf[96];
+    buf[0] = '\0';
+    for (int m = 0; m < MODE_COUNT; m++) {
+        if ((g_hidden_mask & (1u << m)) == 0) {
+            continue;
+        }
+        if (buf[0] != '\0') {
+            strncat(buf, ",", sizeof(buf) - strlen(buf) - 1);
+        }
+        strncat(buf, mode_key(m), sizeof(buf) - strlen(buf) - 1);
+    }
+    return buf;
+}
+
+/* Antes de escribir: lo que el usuario acaba de cambiar va al coche si
+ * hay coche, y si no a la vista global. Asi la vista de un coche no se
+ * cuela en el otro al guardar. */
+static void prefs_capture(void)
+{
+    if (g_vehicle_id[0] != '\0') {
+        /* Solo se guarda lo que el usuario ha ordenado en esta sesion: si
+         * no ha tocado nada, el coche sigue leyendo la vista global y esta
+         * sigue llegandole cuando cambie. */
+        if (!g_layout_dirty) {
+            return;
+        }
+        vehicle_prefs *p = car_prefs_for(g_vehicle_id, 1);
+        if (p != NULL) {
+            memcpy(p->slot_item, g_slot_item, sizeof(g_slot_item));
+            memcpy(p->slot_style, g_slot_style, sizeof(g_slot_style));
+            memcpy(p->tel_item, g_tel_item, sizeof(g_tel_item));
+            p->has_layout = 1;
+        }
+    } else {
+        memcpy(g_global_slot_item, g_slot_item, sizeof(g_slot_item));
+        memcpy(g_global_slot_style, g_slot_style, sizeof(g_slot_style));
+        memcpy(g_global_tel_item, g_tel_item, sizeof(g_tel_item));
+        g_global_rpm_max = g_cfg.rpm_max;
+    }
+}
+
+/* Aviso de la carga de ajustes que se escribe cuando el log ya existe. */
+static void settings_note(const char *fmt, ...)
+{
+    va_list ap;
+    int used = (int)strlen(g_settings_log);
+
+    if (used >= (int)sizeof(g_settings_log) - 1) {
+        return;
+    }
+    va_start(ap, fmt);
+    vsnprintf(g_settings_log + used, sizeof(g_settings_log) - used, fmt, ap);
+    va_end(ap);
+}
+
 static void settings_load(void)
 {
     int psp_lang = PSP_SYSTEMPARAM_LANGUAGE_ENGLISH;
@@ -778,17 +1724,20 @@ static void settings_load(void)
     g_cfg.anim = 1;
     g_cfg.fast = 0;
     g_cfg.peak_hold = 1;
-    g_cfg.smooth = 0;
+    g_cfg.needle = 1;
+    g_cfg.split_values = 3;
     g_cfg.shift_rpm = 4000;
     g_cfg.rpm_max = 7000;
     g_cfg.units = 0;
     g_cfg.boost_auto = 1;
     g_cfg.boost_peak = 0;
     g_cfg.boost_max = 15;
-    g_cfg.smooth = 1;   /* suavizado forzado */
     g_cfg.chime_kmh = 100;
     g_cfg.chime_gap = 9;
     g_cfg.debug = 0;
+    g_cfg.show_fps = 1;
+    g_cfg.log = 2;
+    g_settings_log[0] = '\0';
 
     /* Vista personalizada: valores de fabrica de los seis huecos. */
     g_slot_item[0] = W_RPM;   g_slot_style[0] = STYLE_GAUGE;
@@ -799,14 +1748,41 @@ static void settings_load(void)
     g_slot_item[5] = W_MAP;   g_slot_style[5] = STYLE_TEXT;
     g_tel_item[0] = W_RPM;
     g_tel_item[1] = W_BOOST;
-    g_tel_item[2] = W_ECT;
-    g_tel_item[3] = W_SPEED;
+    g_tel_item[2] = W_TIMING;
+    g_tel_item[3] = W_THR;
     g_tel_item[4] = W_OFF;
 
+    g_car_prefs_count = 0;
+    memset(g_car_prefs, 0, sizeof(g_car_prefs));
+    g_start_mode = -1;
+    g_hidden_mask = 0;
+    /* Sin restaurar esto, la primera conexion reseteaba el tacometro
+     * global a 7000 y la siguiente guarda pisaba lo que el usuario tenia:
+     * layout_apply_for_car() devuelve g_cfg.rpm_max a este valor. */
+    g_global_rpm_max = 7000;
+
     SceUID fd = sceIoOpen(SETTINGS_PATH, PSP_O_RDONLY, 0777);
+    if (fd < 0) {
+        fd = sceIoOpen(LEGACY_SETTINGS_PATH, PSP_O_RDONLY, 0777);
+    }
     if (fd >= 0) {
-        char buf[2048];
-        int n = sceIoRead(fd, buf, sizeof(buf) - 1);
+        /* El fichero lleva las claves globales y un bloque por coche: con
+         * dos coches pasa de 2 KB. Se lee entero, en un buffer estatico
+         * (no en la pila del hilo principal). */
+        static char buf[8192];
+        int n = 0;
+        for (;;) {
+            int chunk = sceIoRead(fd, buf + n, sizeof(buf) - 1 - n);
+            if (chunk <= 0) {
+                break;
+            }
+            n += chunk;
+            if (n >= (int)sizeof(buf) - 1) {
+                settings_note("Ajustes: fichero truncado a %d bytes\n",
+                                n);
+                break;
+            }
+        }
         sceIoClose(fd);
 
         if (n > 0) {
@@ -837,7 +1813,8 @@ static void settings_load(void)
                     g_cfg.contrast = atoi(val);
                 } else if (strcmp(key, "animacion") == 0 ||
                            strcmp(key, "anim") == 0) {
-                    g_cfg.anim = atoi(val) ? 1 : 0;
+                    int v = atoi(val);
+                    g_cfg.anim = (v < 0) ? 0 : (v > 2 ? 2 : v);
                 } else if (strcmp(key, "rapido") == 0 ||
                            strcmp(key, "fast") == 0 ||
                            strcmp(key, "modo") == 0) {
@@ -845,9 +1822,18 @@ static void settings_load(void)
                 } else if (strcmp(key, "pico") == 0 ||
                            strcmp(key, "peak") == 0) {
                     g_cfg.peak_hold = atoi(val) ? 1 : 0;
+                } else if (strcmp(key, "aguja") == 0 ||
+                           strcmp(key, "needle") == 0) {
+                    g_cfg.needle = atoi(val);
                 } else if (strcmp(key, "suavizado") == 0 ||
                            strcmp(key, "smooth") == 0) {
-                    g_cfg.smooth = atoi(val) ? 1 : 0;
+                    /* Clave antigua: 1 era el suavizado forzado, que ahora
+                     * es AGUJA 1; 0 pasa a AGUJA 0. */
+                    g_cfg.needle = atoi(val) ? 1 : 0;
+                } else if (strcmp(key, "reparto") == 0 ||
+                           strcmp(key, "split") == 0 ||
+                           strcmp(key, "split_values") == 0) {
+                    g_cfg.split_values = atoi(val);
                 } else if (strcmp(key, "shift") == 0 ||
                            strcmp(key, "shift_rpm") == 0) {
                     g_cfg.shift_rpm = atoi(val);
@@ -880,8 +1866,33 @@ static void settings_load(void)
                            strcmp(key, "fps_show") == 0 ||
                            strcmp(key, "show_fps") == 0) {
                     g_cfg.show_fps = atoi(val) ? 1 : 0;
+                } else if (strcmp(key, "profile") == 0 ||
+                           strcmp(key, "perfil") == 0 ||
+                           strcmp(key, "vehicle") == 0) {
+                    snprintf(g_cfg.profile, sizeof(g_cfg.profile), "%.23s", val);
+                } else if (strcmp(key, "start") == 0 ||
+                           strcmp(key, "pantalla_inicial") == 0) {
+                    g_start_mode = mode_from_name(val);
+                } else if (strcmp(key, "hidden") == 0 ||
+                           strcmp(key, "ocultas") == 0) {
+                    g_hidden_mask = mode_hidden_parse(val);
+                } else if (key[0] == 'v' && key[1] == '.') {
+                    prefs_parse_key(key, val);
+                } else if (strcmp(key, "last") == 0 ||
+                           strcmp(key, "pantalla") == 0) {
+                    int v = atoi(val);
+                    if (v >= 0 && v < MODE_COUNT) {
+                        g_last_mode = v;
+                    }
                 } else if (strcmp(key, "debug") == 0) {
                     g_cfg.debug = atoi(val) ? 1 : 0;
+                } else if (strcmp(key, "log") == 0) {
+                    int v = atoi(val);
+                    g_cfg.log = (v < 0) ? 0 : (v > 2 ? 2 : v);
+                } else if (strcmp(key, "log_full") == 0 ||
+                           strcmp(key, "log_completo") == 0) {
+                    /* Clave antigua: 1 = cada peticion, 0 = solo la sesion. */
+                    g_cfg.log = atoi(val) ? 2 : 1;
                 } else if (strcmp(key, "elm_gap") == 0 ||
                            strcmp(key, "hueco_elm") == 0) {
                     int v = atoi(val);
@@ -918,10 +1929,16 @@ static void settings_load(void)
     if (g_cfg.contrast < 0 || g_cfg.contrast > 2) {
         g_cfg.contrast = 1;
     }
-    g_cfg.anim = g_cfg.anim ? 1 : 0;
+    /* 0 = sin animacion, 1 = la del MiTo, 2 = la del MX-5. */
+    if (g_cfg.anim < 0 || g_cfg.anim > 2) {
+        g_cfg.anim = 1;
+    }
     g_cfg.fast = g_cfg.fast ? 1 : 0;
     g_cfg.peak_hold = g_cfg.peak_hold ? 1 : 0;
-    g_cfg.smooth = g_cfg.smooth ? 1 : 0;
+    if (g_cfg.needle < 0) g_cfg.needle = 0;
+    if (g_cfg.needle > 2) g_cfg.needle = 2;
+    if (g_cfg.split_values < 0) g_cfg.split_values = 0;
+    if (g_cfg.split_values > 4) g_cfg.split_values = 4;
     g_cfg.units = g_cfg.units ? 1 : 0;
     g_cfg.boost_auto = g_cfg.boost_auto ? 1 : 0;
     if (g_cfg.boost_peak < 0) g_cfg.boost_peak = 0;
@@ -954,6 +1971,8 @@ static void settings_load(void)
     }
     g_cfg.show_fps = g_cfg.show_fps ? 1 : 0;
     g_cfg.debug = g_cfg.debug ? 1 : 0;
+    if (g_cfg.log < 0) g_cfg.log = 0;
+    if (g_cfg.log > 2) g_cfg.log = 2;
 
     /* El aviso INITIAL D es fijo... */
     g_cfg.chime_kmh = 100;
@@ -973,15 +1992,79 @@ static void settings_load(void)
         }
     }
 
+    /* Las series de fabrica cambiaron en fase2.58 (avance y mariposa en vez
+     * de refrigerante y velocidad). Una tarjeta que tenga el juego viejo
+     * guardado no lo cambia sola, porque la deteccion de fabrica acepta los
+     * dos: se migra aqui, una vez, y solo si son exactamente las viejas.
+     * Si el usuario las habia tocado, no se toca nada. */
+    {
+        static const int old_tel[TEL_SLOTS] = { W_RPM, W_BOOST, W_ECT,
+                                                W_SPEED, W_OFF };
+        static const int new_tel[TEL_SLOTS] = { W_RPM, W_BOOST, W_TIMING,
+                                                W_THR, W_OFF };
+        int is_old = 1;
+        for (int i = 0; i < TEL_SLOTS; i++) {
+            if (g_tel_item[i] != old_tel[i]) {
+                is_old = 0;
+            }
+        }
+        if (is_old) {
+            for (int i = 0; i < TEL_SLOTS; i++) {
+                g_tel_item[i] = new_tel[i];
+            }
+            settings_note("Series de telemetria: migradas al juego nuevo\n");
+        }
+    }
+
     settings_apply();
-    log_file_printf("Ajustes: tema=%s contraste=%d animacion=%s\n",
-                    gfx_theme_name(g_cfg.theme), g_cfg.contrast,
-                    g_cfg.anim ? "SI" : "NO");
+
+    /* La vista del fichero es la global: es la que se usa cuando el coche
+     * no trae la suya y la que se vuelve a poner al cambiar de coche. */
+    memcpy(g_global_slot_item, g_slot_item, sizeof(g_slot_item));
+    memcpy(g_global_slot_style, g_slot_style, sizeof(g_slot_style));
+    memcpy(g_global_tel_item, g_tel_item, sizeof(g_tel_item));
+    /* El fondo de escala del fichero tambien: sin esto se quedaba en 7000
+     * de fabrica, la primera conexion de un coche con perfil lo ponia a
+     * 7000 por encima de lo guardado y la siguiente guarda lo escribia en
+     * el disco. */
+    g_global_rpm_max = g_cfg.rpm_max;
+    g_layout_user = !layout_is_factory();
+
+    settings_note("Ajustes: tema=%s contraste=%d animacion=%s%s\n",
+                  gfx_theme_name(g_cfg.theme), g_cfg.contrast,
+                  g_cfg.anim == 0 ? "NO"
+                                  : (g_cfg.anim == 1 ? "MITO" : "MX-5"),
+                  g_layout_user ? " vista=PROPIA" : " vista=FABRICA");
+}
+
+/* Se llama justo despues de log_open(): vuelca lo que la carga de ajustes
+ * dejo anotado. Antes estas lineas se escribian directamente y, al pasar la
+ * carga antes de abrir el archivo, se perdian en cada sesion. */
+/* Cabecera de cada archivo. Vive aparte porque abrir el log desde el menu
+ * (al pasar de NO a SESION o COMPLETO) tiene que volver a escribirla. */
+static void log_banner(void)
+{
+    log_file_printf("PSP Torque - fase 2\n");
+    log_file_printf("build: %s\n", BUILD_TAG);
+    log_file_printf("log: %s\n\n", g_log_path);
+}
+
+static void settings_log_summary(void)
+{
+    if (g_settings_log[0] != '\0') {
+        log_file_printf("%s", g_settings_log);
+    }
 }
 
 static void settings_save(void)
 {
-    SceUID fd = sceIoOpen(SETTINGS_PATH,
+    prefs_capture();
+
+    /* Se escribe al lado y se renombra: si se corta la corriente a mitad,
+     * el archivo bueno sigue entero. Con PSP_O_TRUNC sobre el de verdad,
+     * un corte dejaba settings.txt en cero y se perdian tema, idioma,
+     * huecos y perfil de golpe. */
+    SceUID fd = sceIoOpen(SETTINGS_TMP_PATH,
                           PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC,
                           0777);
     if (fd < 0) {
@@ -989,17 +2072,19 @@ static void settings_save(void)
         return;
     }
 
-    char buf[2048];
+    static char buf[4096];
     int n = snprintf(buf, sizeof(buf),
                      "# PSP Torque - ajustes de tema\n"
                      "# theme: 0=QV ROSSO 1=VERDE 2=AMBAR "
                      "3=AZZURRO 4=MONO 5=FORZA 6=NFS "
                      "7=GRAN TURISMO 8=INITIAL D\n"
                      "# contraste: 0=BAJO 1=NORMAL 2=ALTO\n"
-                     "# animacion: 0=NO 1=SI\n"
+                     "# animacion: 0=NO 1=MITO 2=MX-5\n"
                      "# rapido: 0=COMPLETO 1=RAPIDO\n"
                      "# pico: 0=NO 1=SI\n"
-                     "# suavizado: 0=NO 1=SI\n"
+                     "# aguja: 0=DIRECTA 1=SUAVE 2=MUY SUAVE\n"
+                     "# reparto: valores rapidos en pantalla 0..4 "
+                     "(0 = solo RPM)\n"
                      "# shift: RPM para shift light\n"
                      "# rpm_max: fondo de escala del tacometro\n"
                      "# (la zona roja es automatica: rpm_max - 500)\n"
@@ -1018,7 +2103,8 @@ static void settings_save(void)
                      "animacion=%d\n"
                      "rapido=%d\n"
                      "pico=%d\n"
-                     "suavizado=%d\n"
+                     "aguja=%d\n"
+                     "reparto=%d\n"
                      "shift=%d\n"
                      "rpm_max=%d\n"
                      "unidades=%d\n"
@@ -1038,33 +2124,90 @@ static void settings_save(void)
                      "tel4_item=%d\n"
                      "fps_show=%d\n"
                      "debug=%d\n"
-                     "elm_gap=%d\n",
+                     "log=%d\n"
+                     "elm_gap=%d\n"
+                     "last=%d\n"
+                     "profile=%s\n"
+                     "version=2\n"
+                     "start=%s\n"
+                     "hidden=%s\n",
                      g_cfg.theme, g_cfg.color, g_cfg.lang, g_cfg.contrast, g_cfg.anim,
                      g_cfg.fast, g_cfg.peak_hold,
-                     g_cfg.smooth, g_cfg.shift_rpm, g_cfg.rpm_max,
+                     g_cfg.needle, g_cfg.split_values,
+                     g_cfg.shift_rpm, g_global_rpm_max,
                      g_cfg.units, g_cfg.boost_auto,
                      g_cfg.boost_peak, g_cfg.boost_max,
-                     g_slot_item[0], g_slot_style[0],
-                     g_slot_item[1], g_slot_style[1],
-                     g_slot_item[2], g_slot_style[2],
-                     g_slot_item[3], g_slot_style[3],
-                     g_slot_item[4], g_slot_style[4],
-                     g_slot_item[5], g_slot_style[5],
-                     g_tel_item[0], g_tel_item[1], g_tel_item[2],
-                     g_tel_item[3], g_tel_item[4],
-                     g_cfg.show_fps, g_cfg.debug, g_elm_min_gap_ms);
+                     g_global_slot_item[0], g_global_slot_style[0],
+                     g_global_slot_item[1], g_global_slot_style[1],
+                     g_global_slot_item[2], g_global_slot_style[2],
+                     g_global_slot_item[3], g_global_slot_style[3],
+                     g_global_slot_item[4], g_global_slot_style[4],
+                     g_global_slot_item[5], g_global_slot_style[5],
+                     g_global_tel_item[0], g_global_tel_item[1],
+                     g_global_tel_item[2], g_global_tel_item[3],
+                     g_global_tel_item[4],
+                     g_cfg.show_fps, g_cfg.debug, g_cfg.log,
+                     g_elm_min_gap_ms, g_mode,
+                     g_cfg.profile,
+                     g_start_mode >= 0 ? mode_key(g_start_mode) : "last",
+                     hidden_names_join());
     if (n > (int)sizeof(buf) - 1) {
         n = (int)sizeof(buf) - 1;
     }
     if (n > 0) {
         sceIoWrite(fd, buf, (unsigned int)n);
     }
+    /* Vista de cada coche, en lineas aparte para no engordar el buffer de
+     * arriba: v.<id>.slotN_item=... Solo los coches que tengan algo
+     * guardado, y nunca las claves globales de arriba. */
+    char line[72];
+    for (int c = 0; c < g_car_prefs_count; c++) {
+        const vehicle_prefs *vp = &g_car_prefs[c];
+        if (!vp->has_layout && !vp->has_tacho) {
+            continue;
+        }
+        for (int k = 0; k < DASH_SLOTS; k++) {
+            int n = snprintf(line, sizeof(line), "v.%s.slot%d_item=%d\n",
+                             vp->id, k, vp->slot_item[k]);
+            if (n > 0 && n < (int)sizeof(line)) {
+                sceIoWrite(fd, line, (unsigned)n);
+            }
+            n = snprintf(line, sizeof(line), "v.%s.slot%d_style=%d\n",
+                         vp->id, k, vp->slot_style[k]);
+            if (n > 0 && n < (int)sizeof(line)) {
+                sceIoWrite(fd, line, (unsigned)n);
+            }
+        }
+        for (int k = 0; k < TEL_SLOTS; k++) {
+            int n = snprintf(line, sizeof(line), "v.%s.tel%d_item=%d\n",
+                             vp->id, k, vp->tel_item[k]);
+            if (n > 0 && n < (int)sizeof(line)) {
+                sceIoWrite(fd, line, (unsigned)n);
+            }
+        }
+        if (vp->has_tacho) {
+            int n = snprintf(line, sizeof(line), "v.%s.rpm_max=%d\n",
+                             vp->id, vp->rpm_max);
+            if (n > 0 && n < (int)sizeof(line)) {
+                sceIoWrite(fd, line, (unsigned)n);
+            }
+        }
+    }
+
     sceIoSync("ms0:", 0);
     sceIoClose(fd);
 
+    sceIoRemove(SETTINGS_PATH);
+    int renamed = sceIoRename(SETTINGS_TMP_PATH, SETTINGS_PATH);
+    if (renamed < 0) {
+        log_file_printf("Ajustes: renombrar fallo (0x%08X)\n", renamed);
+        return;
+    }
+
     log_file_printf("Ajustes guardados: tema=%s contraste=%d animacion=%s\n",
                     gfx_theme_name(g_cfg.theme), g_cfg.contrast,
-                    g_cfg.anim ? "SI" : "NO");
+                    g_cfg.anim == 0 ? "NO"
+                                    : (g_cfg.anim == 1 ? "MITO" : "MX-5"));
     log_sync();
 }
 
@@ -1115,63 +2258,188 @@ static void fmt_1(char *buf, size_t size, float value)
              scaled / 10, scaled % 10);
 }
 
-/* TTL de cada PID. Solo los PIDs LENTOS (periodo base de 5 s o mas:
- * aceite, combustible, baro) necesitan un TTL largo: si se piden cada
- * 10-30 s y se descartan a los 6 s, nunca aparecen en la rejilla.
+/* Un filtro de presentacion por PID. Es el unico suavizado del panel:
+ * lo que se guarda, lo que va al log y lo que leen los maximos es la
+ * medida tal cual (ver store_value). */
+static obd_smooth g_ease[256];
+static obd_smooth g_oil_ease;   /* presion de aceite calculada */
+
+
+/* Cadencia real de cada PID: con cuanto tarda de verdad en volver, no con
+ * lo que promete el plan. */
+static uint32_t g_seen_ts[256];
+static uint32_t g_seen_iv_ms[256];
+
+static void disp_reset(void)
+{
+    for (int i = 0; i < 256; i++) {
+        g_seen_ts[i] = 0;
+        g_seen_iv_ms[i] = 0;
+        obd_smooth_reset(&g_ease[i]);
+    }
+    obd_smooth_reset(&g_oil_ease);
+}
+
+/* Apunta el intervalo real entre muestras de un PID. Es lo que decide
+ * cuanto vale una lectura: en el MX-5 el plan promete periodos que el
+ * enlace no siempre cumple, y con la ventana calculada sobre lo prometido
+ * el aire de admision (que volvia cada 7 s) salia N/D en 17 de 87
+ * muestras. */
+static void seen_note(uint8_t pid, uint32_t ts)
+{
+    if (g_seen_ts[pid] != 0u && ts > g_seen_ts[pid]) {
+        uint32_t iv = ts - g_seen_ts[pid];
+        if (iv < 30000u) {
+            g_seen_iv_ms[pid] = g_seen_iv_ms[pid]
+                                    ? (g_seen_iv_ms[pid] * 7u + iv) / 8u
+                                    : iv;
+        }
+    }
+    g_seen_ts[pid] = ts;
+}
+
+/* Cuanto sigue valiendo una muestra.
  *
- * Los PID rapidos conservan el corte de 6 s de siempre: asi una perdida
- * de enlace no dibuja 15 s de linea plana con datos viejos en las
- * graficas de telemetria (la regla del proyecto es no unir huecos). */
-#define SAMPLE_TTL_MIN_MS 6000u
-
-static uint32_t sample_ttl_ms(uint8_t pid)
+ * El tope fijo de 6 s vale en CAN, donde un PID vuelve cada 330 ms. En el
+ * K-line de la MX-5 el plan le da a cada valor visible un periodo de 6 a
+ * 9 s, asi que el tope se cumplia entre muestra y muestra y el cuadro
+ * parpadeaba a N/D un tercio del tiempo (medido en phase1_007: ect N/D en
+ * 45 de 127 muestras, iat 57, velocidad 53). Una lectura vale hasta tres
+ * de sus propios ciclos, con suelo de 6 s y techo de 30. */
+static uint32_t sample_valid_ms(uint8_t pid)
 {
-    uint16_t period = obd_profile_base_period(pid);
-    if (period >= 5000) {
-        return (uint32_t)period * 3u;
+    uint32_t sched = 0;
+    for (int i = 0; i < g_sched.count; i++) {
+        if (g_sched.items[i].pid == pid) {
+            sched = g_sched.items[i].period_ms;
+            break;
+        }
     }
-    return SAMPLE_TTL_MIN_MS;
+    /* Manda el intervalo real cuando ya se conoce; lo prometido es el
+     * suelo. */
+    uint32_t real = g_seen_iv_ms[pid];
+    uint32_t base = (real > sched) ? real : sched;
+    if (base == 0u) {
+        base = 2000u;
+    }
+    uint32_t v = base * 3u;
+    if (v < 6000u) {
+        v = 6000u;
+    }
+    /* fase2.46 del autor original: un PID lento (baro, cada 30 s) vive sus
+     * tres periodos enteros, 90 s, sin el techo de 30 s que lo borraba de la
+     * rejilla antes de que volviese. Los rapidos siguen con su suelo de 6 s
+     * para que un corte no pinte una linea plana larga en la grafica. */
+    if (base < 5000u && v > 30000u) {
+        v = 30000u;
+    }
+    return v;
 }
 
-/* Edad de la muestra de un PID, en ms. 0xFFFFFFFF si nunca se recibio. */
-static uint32_t sample_age_ms(uint8_t pid, uint32_t now)
-{
-    const obd_sample *s = obd_store_get(&g_store, pid);
-    if (s == NULL || !s->valid) {
-        return 0xFFFFFFFFu;
-    }
-    return (uint32_t)(now - s->ts_ms);
-}
-
-/* Color de una caja: si el dato es mas viejo que el doble de su
- * periodo, se atenua para que se vea que no es actual, pero SIGUE
- * siendo legible. Antes esos datos se quitaban de la rejilla. */
-static uint32_t tile_color(uint8_t pid, uint32_t now, uint32_t color)
-{
-    uint16_t period = obd_profile_base_period(pid);
-    if (period == 0) {
-        period = 1000;
-    }
-    uint32_t dim_after = (uint32_t)period * 2u;
-    if (dim_after < 3000u) {
-        dim_after = 3000u;   /* los rapidos no parpadean entre claro/oscuro */
-    }
-    if (sample_age_ms(pid, now) > dim_after) {
-        return gfx_shade(color, 55);
-    }
-    return color;
-}
-
-static int sample_value(uint8_t pid, uint32_t now, float *out)
+/* Lectura exacta, sin suavizado: la medida tal cual llego. Es la que va
+ * al log y a los maximos, que son registro y no presentacion. */
+static int sample_value_raw(uint8_t pid, uint32_t now, float *out)
 {
     const obd_sample *sample = obd_store_get(&g_store, pid);
     if (sample == NULL || !sample->valid) {
         return 0;
     }
-    if ((uint32_t)(now - sample->ts_ms) > sample_ttl_ms(pid)) {
+    /* La cadencia se apunta antes de juzgar la edad: lo que se mide es
+     * cuanto tarda en volver, no si ha caducado ya. */
+    seen_note(pid, sample->ts_ms);
+    if ((uint32_t)(now - sample->ts_ms) > sample_valid_ms(pid)) {
         return 0;
     }
     *out = sample->value;
+    return 1;
+}
+
+/* Color de una caja: si su muestra es mas vieja que el doble del periodo,
+ * se dibuja atenuada al 55 % en vez de desaparecer (fase2.46 del autor
+ * original). Los rapidos tienen un suelo de 3 s para no parpadear entre
+ * claro y oscuro con cada muestra. */
+static uint32_t tile_color(uint8_t pid, uint32_t now, uint32_t color)
+{
+    uint32_t period = 0;
+
+    for (int i = 0; i < g_sched.count; i++) {
+        if (g_sched.items[i].pid == pid) {
+            period = g_sched.items[i].period_ms;
+            break;
+        }
+    }
+    if (period == 0u) {
+        period = 1000u;
+    }
+    /* La base es la misma que la de sample_valid_ms: lo prometido es el
+     * suelo y manda el intervalo real. Con solo lo prometido, un PID que el
+     * enlace entrega cada 7 s contra una promesa de 2-3 s se atenuaba a los
+     * 4-6 s y pasaba medio ciclo al 55 %. */
+    uint32_t real_iv = g_seen_iv_ms[pid];
+    uint32_t base = (real_iv > period) ? real_iv : period;
+    uint32_t dim_after = base * 2u;
+    if (dim_after < 3000u) {
+        dim_after = 3000u;
+    }
+    const obd_sample *s = obd_store_get(&g_store, pid);
+    if (s == NULL || !s->valid) {
+        return color;
+    }
+    if ((uint32_t)(now - s->ts_ms) > dim_after) {
+        return gfx_shade(color, 55);
+    }
+    return color;
+}
+
+/* Presion de aceite calculada: la MX-5 no tiene sensor de presion, asi
+ * que sale de las rpm y del agua con la curva del dueno. Se mueve con un
+ * retardo de ~1 s (la misma ease que la aguja) para que no parpadee al
+ * golpear el acelerador, y siempre se pinta con EST encima: es una
+ * estimacion, no una medida.
+ *
+ *   agua <= 80 C (frio): 3.5 bar al ralenti, 4.6 bar a partir de 2000 rpm
+ *   agua >= 90 C (caliente): 1.0 bar al ralenti, 4.5 bar a 5000 rpm
+ * y lineal en medio. Entre 80 y 90 C se mezclan las dos curvas para que
+ * el numero no salte 2.5 bar justo en el umbral. */
+
+/* Constante de tiempo de la aguja, en milisegundos. 0 = sin suavizado:
+ * se pinta la medida tal cual llego. */
+static float needle_tau_ms(void)
+{
+    if (g_cfg.needle <= 0) {
+        return 0.0f;
+    }
+    return (g_cfg.needle >= 2) ? 400.0f : 150.0f;
+}
+
+/* Lectura para pintar los numeros y las barras: la medida tal cual, sin
+ * suavizado. El ease (AGUJA) se aplica solo a las agujas del tacometro y
+ * del velocimetro, en draw_screen, porque un numero que se mueve solo
+ * entre dos lecturas es un numero que el coche no ha dicho.
+ *
+ * La antiguedad y el N/D se miden aqui, asi que el ease no puede alargar
+ * la vida de un dato. */
+static int sample_value(uint8_t pid, uint32_t now, float *out)
+{
+    return sample_value_raw(pid, now, out);
+}
+
+/* Lectura para una aguja: la medida, y encima el ease del ajuste AGUJA
+ * (ver obd_ease_apply). No extrapola nada: entre dos muestras la aguja se
+ * acerca a la ultima que llego y ahi se queda, asi que nunca ensena un
+ * valor que el coche no haya dado. Si el dato caduca, el filtro se
+ * reinicia y al volver la aguja arranca en la medida nueva. */
+static int sample_value_needle(uint8_t pid, uint32_t now, float *out)
+{
+    if (!sample_value_raw(pid, now, out)) {
+        obd_smooth_reset(&g_ease[pid]);
+        return 0;
+    }
+    float tau = needle_tau_ms();
+    if (tau <= 0.0f) {
+        return 1;
+    }
+    *out = obd_ease_apply(&g_ease[pid], *out, now, tau);
     return 1;
 }
 
@@ -1193,17 +2461,19 @@ static void boost_learn_update(uint32_t now)
     float rpm = 0.0f;
     int wot = 0;
 
-    if (sample_value(0x04, now, &load) && load >= 90.0f) {
+    /* La ventana de aprendizaje se decide con la medida exacta: con la
+     * rampa se abria hasta un segundo tarde. */
+    if (sample_value_raw(0x04, now, &load) && load >= 90.0f) {
         wot = 1;
     }
-    if (sample_value(0x11, now, &thr) && thr >= 90.0f) {
+    if (sample_value_raw(0x11, now, &thr) && thr >= 90.0f) {
         wot = 1;
     }
-    if (g_thr_pid != 0x11 && sample_value(g_thr_pid, now, &thr) &&
+    if (g_thr_pid != 0x11 && sample_value_raw(g_thr_pid, now, &thr) &&
         thr >= 90.0f) {
         wot = 1;
     }
-    if (!wot || !sample_value(0x0C, now, &rpm) || rpm < 3000.0f) {
+    if (!wot || !sample_value_raw(0x0C, now, &rpm) || rpm < 3000.0f) {
         return;
     }
 
@@ -1244,9 +2514,11 @@ static void demo_reset(void)
     g_demo_fuel = 78.0f;
     obd_store_init(&g_store);
     boost_init(&g_boost, PROFILE_BARO_FALLBACK_KPA);
-    g_hist_count = 0;
-    g_hist_pos = 0;
-    g_hist_last = 0;
+    hist_reset();
+    /* Las marcas de validez tambien: sin esto, series_stats recorria las
+     * 180 casillas y las casillas de MAX/MIN ensenaban los extremos de la
+     * sesion anterior hasta que el anillo daba la vuelta. */
+    memset(g_hist_valid, 0, sizeof(g_hist_valid));
     g_fx_speed_prev = 0.0f;
     g_fx_speed_ts = 0;
     g_fx_accel = 0.0f;
@@ -1269,35 +2541,52 @@ static void demo_update(uint32_t now)
     g_demo_last = now;
     g_demo_t += dt;
 
-    /* Perfil de conduccion normal de ~130 s, basado en el uso real del
-     * MiTo: ralenti, salida ciudad, crucero, adelantamiento y vuelta a
-     * ralenti. Se repite sin cortes. */
-    /* Ciclo de 130 s: ralenti, aceleracion, crucero, estirada y frenada. */
-    static const float pts_t[] = {
-        0.0f, 6.0f, 21.0f, 33.0f, 43.0f, 57.0f, 66.0f,
-        78.0f, 88.0f, 98.0f, 108.0f, 118.0f, 130.0f
+    /* Ciclo de 90 s con el caracter del MX-5 NB2: ralenti, salida en
+     * primera, estirada completa en segunda hasta el corte, tercera,
+     * crucero en quinta, frenada y vuelta al ralenti. Se repite sin cortes.
+     *
+     * Cada tramo lleva su marcha, y el rpm sale de la velocidad con el
+     * cambio real del NB2 (relaciones 3,815 / 2,260 / 1,640 / 1,177 / 1,000
+     * / 0,832 y grupo 4,10 sobre rueda de 205/45R16): asi el tacometro, el
+     * velocimetro y la marcha que calcula la propia app cuentan la misma
+     * historia en vez de tres inventadas por separado. */
+    static const float seg_t[] = {
+        0.0f, 6.0f, 11.0f, 11.6f, 18.0f, 18.6f, 25.0f,
+        25.6f, 48.0f, 54.0f, 60.0f, 66.0f, 90.0f
     };
-    static const float pts_v[] = {
-        0.0f, 0.0f, 100.0f, 100.0f, 50.0f, 50.0f, 90.0f,
-        90.0f, 130.0f, 130.0f, 80.0f, 80.0f, 0.0f
+    /* Los tramos de 0,6 s son cambios de marcha: el coche levanta el pie y
+     * pierde unos km/h mientras sube de relacion, como en la carretera. */
+    static const float seg_v[] = {
+        0.0f, 0.0f, 55.0f, 52.0f, 101.0f, 97.0f, 120.0f,
+        116.0f, 105.0f, 60.0f, 20.0f, 0.0f, 0.0f
     };
-    static const int pts_n = 13;
+    static const int seg_g[] = {
+        0, 1, 1, 2, 2, 3, 3, 5, 5, 4, 3, 0, 0
+    };
+    /* Las relaciones no se copian aqui: son las del perfil del coche
+     * (MAZDA_MX5_NB2 en vehicle.c, medidas del coche real), que es la misma
+     * tabla con la que la app deduce la marcha. Asi el tacometro, el
+     * velocimetro y el indicador de marcha no pueden contradecirse. */
+    const obd_vehicle_profile *car = obd_vehicle_by_id("MAZDA_MX5_NB2");
+    const int seg_n = (int)(sizeof(seg_t) / sizeof(seg_t[0]));
 
-    float cycle = fmodf(g_demo_t, 130.0f);
+    float cycle = fmodf(g_demo_t, 90.0f);
     if (cycle < 0.0f) {
         cycle = 0.0f;
     }
 
     float target_speed = 0.0f;
     float slope = 0.0f;
-    for (int i = 0; i < pts_n - 1; i++) {
-        if (cycle >= pts_t[i] && cycle < pts_t[i + 1]) {
-            float span = pts_t[i + 1] - pts_t[i];
+    int gear = 0;
+    for (int i = 0; i < seg_n - 1; i++) {
+        if (cycle >= seg_t[i] && cycle < seg_t[i + 1]) {
+            float span = seg_t[i + 1] - seg_t[i];
             float frac = (span > 0.0f)
-                             ? (cycle - pts_t[i]) / span
+                             ? (cycle - seg_t[i]) / span
                              : 0.0f;
-            target_speed = pts_v[i] + (pts_v[i + 1] - pts_v[i]) * frac;
-            slope = (pts_v[i + 1] - pts_v[i]) / span;
+            target_speed = seg_v[i] + (seg_v[i + 1] - seg_v[i]) * frac;
+            slope = (seg_v[i + 1] - seg_v[i]) / span;
+            gear = seg_g[i];
             break;
         }
     }
@@ -1309,34 +2598,15 @@ static void demo_update(uint32_t now)
         g_demo_speed = 0.0f;
     }
 
-    static const float g_lo_spd[6] = { 0.0f, 25.0f, 45.0f, 65.0f,
-                                       90.0f, 115.0f };
-    static const float g_hi_spd[6] = { 30.0f, 50.0f, 70.0f, 95.0f,
-                                       120.0f, 160.0f };
-    static const float g_lo_rpm[6] = { 900.0f, 1500.0f, 1800.0f,
-                                       1900.0f, 2000.0f, 2200.0f };
-    static const float g_hi_rpm[6] = { 4500.0f, 4200.0f, 4000.0f,
-                                       3700.0f, 3400.0f, 3200.0f };
-
-    int gear = 5;
-    for (int i = 0; i < 5; i++) {
-        if (g_demo_speed < g_hi_spd[i]) {
-            gear = i;
-            break;
-        }
-    }
-
-    if (g_demo_speed < 1.0f) {
+    /* rpm = 1000 x velocidad / (km/h por 1000 rpm de esa marcha). Con la
+     * tabla del perfil, 101 km/h en segunda son 6.966 rpm, que es donde el
+     * coche corta, y 100 en quinta son 2.974, justo lo que marca el suyo. */
+    if (gear <= 0 || g_demo_speed < 1.0f || car == NULL ||
+        gear >= 6 || car->gear_kmh[gear - 1] <= 0.0f) {
         g_demo_rpm = 850.0f + sinf(g_demo_t * 2.0f) * 25.0f;
     } else {
-        float span = g_hi_spd[gear] - g_lo_spd[gear];
-        float within = 0.0f;
-        if (span > 0.0f) {
-            within = (g_demo_speed - g_lo_spd[gear]) / span;
-            within = clamp_float(within, 0.0f, 1.0f);
-        }
-        g_demo_rpm = g_lo_rpm[gear] +
-                     within * (g_hi_rpm[gear] - g_lo_rpm[gear]);
+        g_demo_rpm = g_demo_speed * 1000.0f / car->gear_kmh[gear - 1];
+        g_demo_rpm = clamp_float(g_demo_rpm, 850.0f, 7200.0f);
     }
 
     float accel_req = slope / 3.6f;
@@ -1353,21 +2623,26 @@ static void demo_update(uint32_t now)
         pedal += 12.0f;
         pedal = clamp_float(pedal, 0.0f, 95.0f);
     }
+    /* Una estirada de verdad es a fondo: con el pedal que sale de la
+     * pendiente (78-81 %) el MAP no pasaba de 83 kPa y el MAF de 77 g/s,
+     * que no es lo que ensena el coche cuando estira. */
+    if (slope > 3.0f && pedal < 92.0f) {
+        pedal = 92.0f;
+    }
 
     float plate = 12.5f + pedal * 0.77f;
     plate = clamp_float(plate, 12.5f, 89.5f);
 
+    /* El NB2 es atmosferico: 30 kPa con la mariposa cerrada, 96 a fondo, y
+     * en retencion baja de ahi. Nada de los 200 kPa del MiTo turbado, que en
+     * un MX-5 serian una averia y no una medida. */
     float baro_kpa = 97.6f + sinf(g_demo_t / 300.0f) * 0.6f;
-    float vac = 0.0f;
-    if (g_demo_speed > 5.0f && pedal < 8.0f) {
-        vac = 15.0f;
+    float map_kpa = 30.0f + (pedal / 100.0f) * 66.0f;
+    if (g_demo_speed > 5.0f && pedal < 3.0f) {
+        map_kpa = 26.0f;
     }
-    float boost = 0.0f;
-    if (pedal > 25.0f) {
-        boost = powf((pedal - 25.0f) / 75.0f, 1.2f) * 200.0f;
-    }
-    float map_kpa = 45.0f - (pedal / 100.0f) * 18.0f - vac + boost;
-    map_kpa = clamp_float(map_kpa, 20.0f, 236.0f);
+    map_kpa += sinf(g_demo_t * 1.7f) * 0.8f;
+    map_kpa = clamp_float(map_kpa, 20.0f, 100.0f);
 
     float load = 10.0f + pedal * 0.9f;
     if (g_demo_speed < 1.0f) {
@@ -1380,17 +2655,19 @@ static void demo_update(uint32_t now)
 
     float adv = 0.0f;
     if (g_demo_speed < 1.0f) {
-        adv = 5.0f + sinf(g_demo_t * 0.5f) * 2.0f;
+        adv = 10.0f + sinf(g_demo_t * 0.5f) * 2.0f;
     } else {
-        adv = 12.0f + (1.0f - load / 100.0f) * 30.0f -
-              (boost / 100.0f) * 10.0f;
+        /* Sin turbo no hay retardo por presion: el avance es funcion de la
+         * carga, de ~16 grados a fondo a ~36 en crucero. */
+        adv = 14.0f + (1.0f - load / 100.0f) * 26.0f;
     }
     adv += sinf(g_demo_t * 1.3f) * 1.5f;
     adv = clamp_float(adv, 0.0f, 60.0f);
 
-    float ect = 80.0f + 4.0f * (1.0f - expf(-g_demo_t / 240.0f)) +
-                sinf(g_demo_t / 45.0f) * 1.2f;
-    ect = clamp_float(ect, 27.0f, 90.0f);
+    /* Agua del NB2: se queda en 88-92 C, no en los 80 del MiTo. */
+    float ect = 88.0f + 3.0f * (1.0f - expf(-g_demo_t / 180.0f)) +
+                sinf(g_demo_t / 50.0f) * 1.0f;
+    ect = clamp_float(ect, 27.0f, 95.0f);
 
     float iat = 28.0f + 4.0f * sinf(g_demo_t / 90.0f) +
                 (1.0f - g_demo_speed / 130.0f) * 2.0f;
@@ -1455,6 +2732,11 @@ static void demo_update(uint32_t now)
                   OBD_SRC_SIMULATED);
     obd_store_set(&g_store, 0x15, o2_2, OBD_UNIT_VOLT, now,
                   OBD_SRC_SIMULATED);
+    /* MAF del MX-5: el caudal que pide ese regimen. Con carga 95 % y 6900
+     * rpm son 89 g/s, que es lo que midio la sonda del coche real. */
+    float maf = 1.5f + (g_demo_rpm * (load / 100.0f)) / 75.0f;
+    obd_store_set(&g_store, 0x10, maf, OBD_UNIT_GRAMS_SEC, now,
+                  OBD_SRC_SIMULATED);
     obd_store_set(&g_store, 0x21, g_demo_dist_mil, OBD_UNIT_KM, now,
                   OBD_SRC_SIMULATED);
 
@@ -1466,16 +2748,18 @@ static void demo_update(uint32_t now)
 static void demo_apply_flags(int on)
 {
     if (on) {
-        /* Demo basado en el MiTo 1.4 170cv: MAP (sin MAF), pedal 0x49,
-         * combustible y trims/avance con la codificacion no estandar. */
+        /* Demo del MX-5 NB2: MAF (0x10) manda, la mariposa es la estandar
+         * (0x11) y los trims y el avance van con la codificacion normal. El
+         * MAP sigue disponible para que el boost del TELEM y la presion de
+         * aceite calculada tengan de donde salir. */
         g_oil_supported = 0;
         g_fuel_supported = 1;
         g_map_supported = 1;
-        g_maf_supported = 0;
-        g_pedal_supported = 1;
-        g_thr_pid = 0x49;
-        g_thr_label = "ACELERADOR";
-        obd_pid_set_mito_encoding(1);
+        g_maf_supported = 1;
+        g_pedal_supported = 0;
+        g_thr_pid = 0x11;
+        g_thr_label = "MARIPOSA";
+        obd_pid_set_mito_encoding(0);
     } else {
         g_oil_supported = 0;
         g_fuel_supported = 0;
@@ -1491,16 +2775,48 @@ static void demo_apply_flags(int on)
     }
 }
 
+/* El demo viste el coche: perfil del MX-5 (tacometro 8000, zona roja 7000,
+ * corte 7200), centro de MAF y su vista, que es donde estan el bloque de
+ * aire/aceite/agua, la marcha y el avance. Se aplica UNA vez al entrar y al
+ * salir del demo, nunca desde settings_apply(): hacerlo en cada cambio de
+ * ajuste era lo unico nuevo en ese camino cuando la consola se quedo
+ * colgada, y no hay razon para tocar el perfil mientras se edita un ajuste. */
+static void demo_apply_car(int on)
+{
+    const obd_vehicle_profile *p = obd_vehicle_by_id("MAZDA_MX5_NB2");
+
+    if (p == NULL) {
+        return;
+    }
+    if (on) {
+        g_profile_tach = p->rpm_max;
+        g_profile_redline = p->redline;
+        g_profile_cut = p->fuel_cut;
+        g_vehicle_centre = p->centre;
+        snprintf(g_vehicle_id, sizeof(g_vehicle_id), "%s", p->id);
+        snprintf(g_vehicle_name, sizeof(g_vehicle_name), "%s", p->name);
+        log_file_printf("Demo: perfil %s, vista del coche\n", p->name);
+    } else {
+        vehicle_release_tacho();
+        g_vehicle_centre = OBD_CENTRE_FROM_CAPS;
+        g_vehicle_id[0] = '\0';
+        g_vehicle_name[0] = '\0';
+    }
+    layout_apply_for_car();
+}
+
 static void demo_toggle(void)
 {
     g_demo = !g_demo;
 
     if (g_demo) {
+        demo_apply_car(1);
         demo_apply_flags(1);
         demo_reset();
         log_file_printf("MODO DEMO activado (datos SIM)\n");
     } else {
         demo_apply_flags(0);
+        demo_apply_car(0);
         obd_store_init(&g_store);
         boost_init(&g_boost, PROFILE_BARO_FALLBACK_KPA);
         if (g_link_connected) {
@@ -1541,6 +2857,9 @@ static int load_targets(Target *list, int max)
     int count = 0;
 
     SceUID fd = sceIoOpen(CONFIG_PATH, PSP_O_RDONLY, 0777);
+    if (fd < 0) {
+        fd = sceIoOpen(LEGACY_CONFIG_PATH, PSP_O_RDONLY, 0777);
+    }
     if (fd >= 0) {
         char buf[768];
         int n = sceIoRead(fd, buf, sizeof(buf) - 1);
@@ -1890,7 +3209,7 @@ static int handle_line(elm_reply *reply, const char *line)
     } else {
         can_err_streak = 0;
     }
-    if (log_line) {
+    if (log_line && g_cfg.log >= 2) {
         log_file_printf("  %s\n", text);
     }
 
@@ -1908,6 +3227,13 @@ static int handle_line(elm_reply *reply, const char *line)
 
     if (strncmp(text, "STOPPED", 7) == 0) {
         reply->stopped = 1;
+    }
+
+    /* El ELM327 esta buscando el protocolo. En K-line esa busqueda
+     * puede tardar 10-15 s y cortarla lo deja en STOPPED, asi que se
+     * trata como "sigue esperando", no como respuesta. */
+    if (strncmp(text, "SEARCHING", 9) == 0) {
+        reply->searching = 1;
     }
 
     if (reply->text[0] == '\0' && !is_noise_line(text)) {
@@ -1989,7 +3315,10 @@ static int elm_rx_send(elm_rx *rx, uint32_t now)
 {
     char tx[64];
     snprintf(tx, sizeof(tx), "%s\r", rx->cmd);
-    log_file_printf("> %s%s\n", rx->cmd, rx->attempt ? " (reintento)" : "");
+    if (g_cfg.log >= 2) {
+        log_file_printf("> %s%s\n", rx->cmd,
+                        rx->attempt ? " (reintento)" : "");
+    }
 
     if (send_all(rx->sock, tx, (int)strlen(tx)) < 0) {
         return -1;
@@ -2132,9 +3461,18 @@ static elm_rx_status elm_rx_step(elm_rx *rx)
         }
     }
 
-    /* Timeout global. */
-    if ((int)(now - rx->start) >= rx->wait_ms) {
-        goto complete;
+    /* Timeout global. Mientras el adaptador dice SEARCHING se le da un
+     * margen largo: la busqueda de protocolo en K-line tarda 10-15 s y
+     * abortarla a los 3 s deja al ELM327 atascado en STOPPED para el
+     * resto de la sesion. */
+    {
+        uint32_t limit = (uint32_t)rx->wait_ms;
+        if (rx->reply.searching && limit < ELM_SEARCH_WAIT_MS) {
+            limit = ELM_SEARCH_WAIT_MS;
+        }
+        if ((uint32_t)(now - rx->start) >= limit) {
+            goto complete;
+        }
     }
 
     return ELM_RX_PENDING;
@@ -2146,10 +3484,12 @@ complete:
         rx->line_len = 0;
     }
 
-    log_file_printf("  [%s %dms%s]\n",
-                    rx->reply.prompt ? "prompt" : "sin prompt",
-                    (int)(now - rx->start),
-                    rx->reply.stopped ? " STOPPED" : "");
+    if (g_cfg.log >= 2) {
+        log_file_printf("  [%s %dms%s]\n",
+                        rx->reply.prompt ? "prompt" : "sin prompt",
+                        (int)(now - rx->start),
+                        rx->reply.stopped ? " STOPPED" : "");
+    }
 
     /* STOPPED: el ELM se atasco; reintentar una vez. */
     if (rx->reply.stopped && rx->attempt == 0) {
@@ -2177,6 +3517,12 @@ static void elm_send_and_read(int sock, const char *cmd, int wait_ms,
 
     for (;;) {
         net_ui_tick();
+        if (g_exit_request) {
+            /* Se sale: no tiene sentido esperar la respuesta. El llamante
+             * desenrolla y el bucle principal cierra la sesion. */
+            rx.active = 0;
+            break;
+        }
         if (elm_rx_step(&rx) != ELM_RX_PENDING) {
             break;
         }
@@ -2185,11 +3531,33 @@ static void elm_send_and_read(int sock, const char *cmd, int wait_ms,
     }
 
     *reply = rx.reply;
+
+    /* FASE K1b: con el registro completo activado se apunta cada peticion y
+     * cada respuesta. Es lo que permite reconstruir una sesion sin adivinar
+     * (y lo que pidio ivan para poder mandar el log entero). */
+    if (g_cfg.log >= 2) {
+        const char *st = reply->data ? "OK"
+                        : (reply->no_data ? "NO DATA"
+                        : (reply->error ? "ERROR"
+                        : (reply->searching ? "BUSCANDO"
+                        : (reply->stopped ? "STOPPED" : "?"))));
+        log_file_printf("> %s  <%s %s\n", cmd, st, reply->text);
+    }
 }
 
 /* ------------------------------------------------------------------ */
 /* Envio de la siguiente peticion OBD (FASE C).                       */
 /* ------------------------------------------------------------------ */
+
+/* Tiempo maximo de una peticion de PID, segun lo que tarde el bus. */
+static int cmd_timeout_ms(void)
+{
+    int cls = obd_vehicle_proto_class(g_proto);
+    if (cls == OBD_PROTO_ISO9141 || cls == OBD_PROTO_KWP) {
+        return CMD_TIMEOUT_KLINE_MS;
+    }
+    return CMD_TIMEOUT_MS;
+}
 
 /* Envia el PID que toque segun el planificador. Devuelve 1 si se ha
  * enviado, 0 si no tocaba nada y -1 si el envio ha fallado.
@@ -2221,7 +3589,7 @@ static int obd_send_next(int sock, elm_rx *rx, int *rx_idx, uint8_t *rx_pid,
     *rx_pid = pid;
     *rx_t0 = now_ms();
 
-    if (elm_rx_start(rx, sock, cmd, CMD_TIMEOUT_MS) < 0) {
+    if (elm_rx_start(rx, sock, cmd, cmd_timeout_ms()) < 0) {
         /* El socket esta muerto. Se libera el PID como si fuera un
          * timeout (no como "no soportado") para que el planificador no
          * se quede colgado con la peticion en vuelo. */
@@ -2251,20 +3619,10 @@ static void store_value(uint8_t pid, const elm_frame *frame, uint32_t ts)
         return;
     }
 
+    /* Lo que se guarda es la medida tal cual llego: el log, los maximos
+     * y el historico son registro, no presentacion. El unico suavizado es
+     * el de las agujas, en sample_value_needle(). */
     float v = value.value;
-
-    /* Suavizado EMA opcional (constante de tiempo fija). */
-    if (g_cfg.smooth) {
-        if (pid == 0x0C) {
-            v = obd_smooth_apply(&g_ema_rpm, v, ts);
-        } else if (pid == 0x0B) {
-            v = obd_smooth_apply(&g_ema_map, v, ts);
-        } else if (pid == 0x0D) {
-            v = obd_smooth_apply(&g_ema_speed, v, ts);
-        } else if (pid == g_thr_pid) {
-            v = obd_smooth_apply(&g_ema_thr, v, ts);
-        }
-    }
 
     obd_store_set(&g_store, pid, v, value.unit, ts, OBD_SRC_REAL);
 
@@ -2281,8 +3639,8 @@ static void maybe_capture_key_on(uint32_t now, uint32_t session_ms)
     float rpm_value = 0.0f;
     float speed_value = 0.0f;
 
-    if (!sample_value(0x0B, now, &map_value) ||
-        !sample_value(0x0C, now, &rpm_value)) {
+    if (!sample_value_raw(0x0B, now, &map_value) ||
+        !sample_value_raw(0x0C, now, &rpm_value)) {
         return;
     }
 
@@ -2310,6 +3668,101 @@ static void apply_support_masks(void)
     }
 }
 
+/* FASE U4: que coche es. Se decide una vez por conexion, con la evidencia
+ * que ya tenemos (ATDPN y las tres mascaras), y se escribe en el log: sin
+ * esa linea, un cuadro equivocado no se puede explicar despues. */
+static int g_vehicle_seen = 0;
+
+static void vehicle_detect(void)
+{
+    if (g_vehicle_seen) {
+        return;
+    }
+
+    /* "A0" es el unico estado en el que el adaptador aun no ha elegido
+     * protocolo: justo despues de ATSP0 contesta eso, y en ese momento
+     * cualquier mascara casa con el generico. Como la deteccion se hace
+     * una sola vez por conexion, el coche se quedaba sin perfil para el
+     * resto de la sesion: paso el 18/11/2026 con la MX-5, que salio como
+     * "Generic K-line" mientras el ATDPN ya decia A3 dos lineas mas abajo.
+     *
+     * Se mira el texto y no la clase: un coche J1850 (protocolo 1 o 2)
+     * tambien da clase ANY, y ahi lo correcto es intentar el emparejamiento
+     * y quedarse sin perfil, no esperar para siempre. */
+    {
+        size_t pn = strlen(g_proto);
+        int pending = (pn == 0) || (strcmp(g_proto, "?") == 0) ||
+                      (g_proto[pn - 1] == '0');
+        if (pending) {
+            log_file_printf("Vehiculo: pendiente (proto %s)\n", g_proto);
+            return;
+        }
+    }
+
+    g_vehicle_seen = 1;
+
+    int exact = 0;
+    int proto = obd_vehicle_proto_class(g_proto);
+    const obd_vehicle_profile *p = obd_vehicle_match(
+        proto, g_mask1, g_mask2, g_mask3, g_cfg.profile, &exact);
+
+    if (p == NULL) {
+        /* Sin identidad no hay vista de coche: lo que se edite va a la
+         * global, no a las preferencias del coche anterior. */
+        g_vehicle_id[0] = '\0';
+        g_vehicle_name[0] = '\0';
+        layout_apply_for_car();
+        log_file_printf("Vehiculo: sin perfil (proto %s, mascaras %08X/%08X/%08X)\n",
+                        g_proto, g_mask1, g_mask2, g_mask3);
+        return;
+    }
+
+    /* Un perfil generico no toca nada: el tacometro y la zona roja se
+     * quedan como los tenga el usuario. Y lo detectado no se escribe en
+     * settings.txt: si un dia no hay coche, sigue valiendo lo suyo. */
+    vehicle_release_tacho();
+    if (!p->generic) {
+        g_profile_tach = p->rpm_max;
+        g_profile_redline = p->redline;
+        g_profile_cut = p->fuel_cut;
+    }
+
+    /* El centro del cuadro, por capacidad: con MAP y baro hay boost; sin
+     * MAP pero con MAF se pinta MAF; sin ninguno de los dos, carga. Un
+     * perfil puede decirlo (la MX-5 dice MAF); si no, se deduce de lo que
+     * el coche declara. */
+    if (p->centre == OBD_CENTRE_FROM_CAPS) {
+        /* 0x33 (baro) vive en el bloque 0x20: mascara 2, bit 0x13. */
+        if (g_map_supported && obd_mask_supports(g_mask2, 0x13)) {
+            g_vehicle_centre = OBD_CENTRE_BOOST;
+        } else if (g_maf_supported) {
+            g_vehicle_centre = OBD_CENTRE_MAF;
+        } else {
+            g_vehicle_centre = OBD_CENTRE_LOAD;
+        }
+    } else {
+        g_vehicle_centre = p->centre;
+    }
+
+    /* Identidad para las preferencias por coche y su vista, si tiene. */
+    snprintf(g_vehicle_id, sizeof(g_vehicle_id), "%s",
+             p->generic ? "" : p->id);
+    snprintf(g_vehicle_name, sizeof(g_vehicle_name), "%s",
+             p->generic ? "" : p->name);
+    layout_apply_for_car();
+
+    log_file_printf("Vehiculo: %s (%s, proto %s, mascaras %08X/%08X/%08X)"
+                    " tacometro=%d rojo=%d corte=%d\n",
+                    p->name,
+                    (g_cfg.profile[0] &&
+                     obd_vehicle_by_id(g_cfg.profile) != NULL)
+                        ? "forzado" : (exact ? "detectado" : "generico"),
+                    g_proto, g_mask1, g_mask2, g_mask3,
+                    (int)tach_max_rpm(),
+                    p->generic ? g_profile_redline : p->redline,
+                    p->generic ? g_profile_cut : p->fuel_cut);
+}
+
 /* ------------------------------------------------------------------ */
 /* Reparto del ancho de banda por pantalla (FASE F3).                  */
 /* ------------------------------------------------------------------ */
@@ -2327,7 +3780,7 @@ static uint8_t widget_pid(int item)
     case W_MAF:      return 0x10;
     case W_THR:      return (uint8_t)g_thr_pid;
     case W_LOAD:     return 0x04;
-    case W_PLATE:    return 0x0D;
+    case W_PLATE:    return 0x11;
     case W_VOLT:     return 0x42;
     case W_OIL:      return 0x5C;
     case W_FUEL:     return 0x2F;
@@ -2338,7 +3791,46 @@ static uint8_t widget_pid(int item)
     case W_O2_2:     return 0x15;
     case W_DIST_MIL: return 0x21;
     case W_BARO:     return 0x33;
+    /* Derivados: no tienen PID propio, pero el cuadro no puede quedar a
+     * cero sin el dato del que salen. La marcha se calcula con RPM y
+     * velocidad; el turbo, con el MAP (un motor sin MAP no tiene boost). */
+    case W_GEAR:     return 0x0D;
+    case W_AUX:      return 0x10;   /* aire; el agua la pide el plan aparte */
+    case W_BOOST:    return g_map_supported ? 0x0B : 0;
     default:         return 0;
+    }
+}
+
+/* Importancia de un valor en el reparto del enlace. El RPM va aparte; de
+ * los demas, primero lo que se mira de reojo mientras se conduce
+ * (velocidad y carga), despues lo que se lee de un vistazo (avance y
+ * mariposa) y al final las temperaturas, que cambian despacio. */
+#define VALUE_PRIO_COUNT 6
+
+static int pid_priority(uint8_t pid)
+{
+    switch (pid) {
+    case 0x0D:              /* velocidad */
+        return 1;
+    case 0x0B:              /* MAP */
+    case 0x10:              /* MAF */
+    case 0x04:              /* carga calculada */
+    case 0x43:              /* carga absoluta */
+        return 2;
+    case 0x0E:              /* avance */
+        return 3;
+    case 0x11:              /* mariposa */
+    case 0x49:              /* pedal */
+    case 0x4A:              /* pedal, alternativo */
+    case 0x5A:              /* pedal, relativo */
+        return 4;
+    case 0x05:              /* refrigerante */
+    case 0x0F:              /* aire de admision */
+    case 0x5C:              /* aceite */
+    case 0x46:              /* ambiente */
+        return 5;
+    default:
+        return 6;
     }
 }
 
@@ -2352,6 +3844,7 @@ static uint8_t widget_pid(int item)
 static void apply_screen_schedule(uint32_t now)
 {
     uint8_t mode_mask;
+    float demand = 0.0f;
 
     switch (g_mode) {
     case MODE_ENGINE:
@@ -2375,34 +3868,129 @@ static void apply_screen_schedule(uint32_t now)
     memset(&forced, 0, sizeof(forced));
     if (g_mode == MODE_QV) {
         for (int i = 0; i < DASH_SLOTS; i++) {
-            uint8_t pid = widget_pid(g_slot_item[i]);
+            int item = slot_item_eff(i);
+            uint8_t pid = widget_pid(item);
             if (pid != 0) {
                 obd_forced_set_add(&forced, pid);
+            }
+            /* El bloque del GENERAL necesita el agua ademas del aire. */
+            if (item == W_AUX) {
+                obd_forced_set_add(&forced, 0x05);
             }
         }
     } else if (g_mode == MODE_TELEMETRY) {
         for (int i = 0; i < TEL_SLOTS; i++) {
-            uint8_t pid = widget_pid(g_tel_item[i]);
+            uint8_t pid = widget_pid(tel_item_eff(i));
             if (pid != 0) {
                 obd_forced_set_add(&forced, pid);
             }
         }
     }
 
+    /* FASE K2: si la tabla base no cabe en el presupuesto del enlace se
+     * reparte por capacidad; si cabe, obd_plan_period devuelve la tabla tal
+     * cual y el coche rapido no cambia de comportamiento. */
+    obd_plan_init(&g_link_plan, link_capacity(), g_link_service_ms,
+                  obd_profile_demand(mode_mask), g_cfg.split_values);
+    obd_sched_set_strict(&g_sched, g_link_plan.compressed);
+
+    /* Que valores entran en el reparto. En las pantallas con huecos
+     * configurables (GENERAL y TELEMETRIA) solo cuenta lo que se PINTA; en
+     * las demas, lo que el perfil marca como visible para esa pantalla.
+     * Antes contaba todo lo visible por mascara aunque no estuviera en
+     * pantalla: en phase1_010 eran trece PID pidiendo turno, y el RPM se
+     * quedaba con las sobras. */
+    int by_slot = (g_mode == MODE_QV || g_mode == MODE_TELEMETRY);
+    int value_count = 0;
     for (int i = 0; i < g_sched.count; i++) {
         uint8_t pid = g_sched.items[i].pid;
-        uint8_t mask = obd_profile_visible_mask(pid);
-        int visible = (mask & mode_mask) != 0 ||
-                      obd_forced_set_has(&forced, pid);
-        uint16_t period = obd_profile_period(pid, visible);
+        int on_screen = by_slot
+                            ? obd_forced_set_has(&forced, pid)
+                            : (obd_profile_visible_mask(pid) & mode_mask) != 0;
+        if (on_screen && pid != 0x0C && g_sched.items[i].supported != 2) {
+            value_count++;
+        }
+    }
+
+    /* Rango de reparto. Antes salia del orden de la tabla y el avance
+     * (0x0E) y la mariposa (0x11) — que el perfil marca como DIAG — caian
+     * al fondo: con el plan comprimido del K-line les tocaba el periodo de
+     * fondo, 60 s, y en pantalla salian N/D. Ahora manda la importancia del
+     * dato: velocidad, carga, avance, mariposa, temperaturas y el resto.
+     * Los no soportados no cogen rango. */
+    /* Manda la importancia del dato, no el orden de la tabla: con REPARTO
+     * por debajo de lo que se pinta, el que paga es el menos importante
+     * (una temperatura), no el avance por haber caido tarde en la lista. */
+    int rank_of[OBD_SCHED_MAX];
+    memset(rank_of, 0, sizeof(rank_of));
+    {
+        int rank = 0;
+        for (int prio = 1; prio <= VALUE_PRIO_COUNT; prio++) {
+            for (int i = 0; i < g_sched.count && i < OBD_SCHED_MAX; i++) {
+                uint8_t pid = g_sched.items[i].pid;
+                if (pid == 0x0C || g_sched.items[i].supported == 2) {
+                    continue;
+                }
+                if (pid_priority(pid) != prio) {
+                    continue;
+                }
+                int on_screen = by_slot
+                                    ? obd_forced_set_has(&forced, pid)
+                                    : (obd_profile_visible_mask(pid) &
+                                       mode_mask) != 0;
+                if (!on_screen) {
+                    continue;
+                }
+                rank_of[i] = ++rank;
+            }
+        }
+    }
+
+    for (int i = 0; i < g_sched.count; i++) {
+        uint8_t pid = g_sched.items[i].pid;
+        int visible = by_slot
+                          ? obd_forced_set_has(&forced, pid)
+                          : (obd_profile_visible_mask(pid) & mode_mask) != 0;
+        int my_rank = rank_of[i];
+        uint16_t period = obd_plan_period(&g_link_plan, pid, visible,
+                                          my_rank, value_count);
         if (period == 0) {
             /* PID sin entrada en la tabla: periodo lento, nunca 10 Hz. */
             period = 10000;
         }
         int was_due = (int32_t)(now - g_sched.items[i].next_due_ms) >= 0;
+        /* Lo que se pinta y acaba de aparecer pasa a pendiente al
+         * instante; lo que no se pinta y llega vencido (tabla recien
+         * montada, reconexion, cambio de pantalla) se aplaza dentro de su
+         * periodo: son datos que nadie ve y su primer turno se comia el
+         * enlace que necesita el RPM. En phase1_012, siete PID fuera de
+         * pantalla gastaron 19 de las 151 peticiones del primer minuto. */
         obd_sched_set_period(&g_sched, i, period,
                              visible && !was_due ? 1 : 0);
+        if (pid != 0x0C && !visible && was_due && g_link_plan.compressed) {
+            /* El RPM no se aplaza nunca: el plan le da su ritmo aunque la
+             * aguja no este en un hueco (la marcha y los avisos salen de
+             * el), y es el unico dato que se nota cuando va lento. */
+            obd_sched_defer(&g_sched, i, now);
+        }
+
+        /* Con el enlace comprimido la prioridad pasa a ser el nivel del
+         * plan (RPM, valores en pantalla, fondo). Sin comprimir se devuelve
+         * la de la tabla, que es la que guarda build_scheduler. */
+        if (g_link_plan.compressed) {
+            uint8_t tier = (pid == 0x0C) ? 0 : (visible ? 1 : 2);
+            if (g_sched.items[i].priority != tier) {
+                obd_sched_set_priority(&g_sched, i, tier);
+            }
+        } else if (g_sched.items[i].priority != g_prio_orig[i]) {
+            obd_sched_set_priority(&g_sched, i, g_prio_orig[i]);
+        }
+
+        if (g_sched.items[i].supported != 2 && period > 0) {
+            demand += 1000.0f / (float)period;
+        }
     }
+    g_plan_demand = demand;
 }
 
 static void build_scheduler(void)
@@ -2459,6 +4047,11 @@ static void build_scheduler(void)
             obd_sched_add(&g_sched, pid, obd_profile_base_period(pid),
                           PROFILE_MOTOR_POLL[i].priority);
         }
+    } else if (g_mask1 != 0 && obd_mask_supports(g_mask1, 0x0E)) {
+        /* En modo rapido el avance tambien entra: es un hueco del GENERAL
+         * en un coche sin MAP y una de las series por defecto del TELEM, y
+         * fuera de la tabla no lo pide nadie, asi que salia N/D. */
+        obd_sched_add(&g_sched, 0x0E, obd_profile_base_period(0x0E), 2);
     }
 
     /* Pedal del acelerador: 0x49 (posicion D) o 0x4A (posicion E)
@@ -2485,6 +4078,16 @@ static void build_scheduler(void)
     }
 
     apply_support_masks();
+    vehicle_detect();
+
+    /* Si la pantalla en la que estabamos no vale para este coche (p. ej.
+     * SNIFFER elegido antes de conectar con un K-line), se vuelve a
+     * GENERAL: quedarse ahi ofrece un boton que habla CAN en un bus que no
+     * lo es. */
+    if (!mode_is_driving(g_mode) && !screen_available(g_mode)) {
+        g_mode = MODE_QV;
+        g_picker_open = 0;
+    }
 
     log_file_printf("Acelerador: 0x%02X (%s), pedal=%s\n",
                     g_thr_pid, g_thr_label,
@@ -2492,6 +4095,12 @@ static void build_scheduler(void)
     log_file_printf("Soporte: aceite=%s combustible=%s mariposa=0x11\n",
                     g_oil_supported ? "SI" : "NO",
                     g_fuel_supported ? "SI" : "NO");
+
+    /* FASE K2: guardar las prioridades de la tabla, que son a las que se
+     * vuelve en cuanto el enlace deja de estar comprimido. */
+    for (int i = 0; i < g_sched.count && i < OBD_SCHED_MAX; i++) {
+        g_prio_orig[i] = g_sched.items[i].priority;
+    }
 
     /* FASE F3: los periodos dependen de la pantalla activa. */
     apply_screen_schedule(now_ms());
@@ -2510,12 +4119,31 @@ static int connect_network_and_elm(Target *targets, int *target_count,
     g_connect_cancel = 0;
     g_elm_stuck = 0;
     g_try_atz = 0;
+    g_elm_window = 0;
+    g_no_data_streak = 0;
+    g_sample_iv_ms = 0;
+    g_last_sample_ms = 0;
+    disp_reset();
 
     obd_store_init(&g_store);
     boost_init(&g_boost, PROFILE_BARO_FALLBACK_KPA);
     g_mask1 = 0;
     g_mask2 = 0;
     g_mask3 = 0;
+    g_vehicle_seen = 0;
+    /* Identidad de la conexion anterior: si esta no se llega a detectar (un
+     * ATDPN perdido, el coche callado), el cuadro no puede quedarse con el
+     * tacometro, el centro ni las preferencias del coche que acaba de irse. */
+    g_vehicle_id[0] = '\0';
+    g_vehicle_name[0] = '\0';
+    g_vehicle_centre = OBD_CENTRE_FROM_CAPS;
+    vehicle_release_tacho();
+    /* Codigos de la sesion anterior: la lampara del coche que acaba de
+     * irse no puede quedarse encendida en la barra del siguiente. */
+    g_dtc_mil = -1;
+    g_dtc_state = 0;
+    g_dtc_count = -1;
+    g_ff_valid = 0;
     g_thr_pid = 0x11;
     g_thr_label = "MARIPOSA";
     g_oil_supported = 0;
@@ -2641,6 +4269,12 @@ static int connect_network_and_elm(Target *targets, int *target_count,
     }
 
     if (g_connect_cancel) {
+        /* Puede haber un socket abierto si el SELECT llego despues de
+         * conectar con el objetivo pero antes de devolverlo. */
+        if (sock >= 0) {
+            sceNetInetClose(sock);
+            sock = -1;
+        }
         log_file_printf("Conexion cancelada por el usuario.\n");
         net_ui_set("CANCELADO");
         g_net_busy = 0;
@@ -2677,7 +4311,13 @@ static int connect_network_and_elm(Target *targets, int *target_count,
         elm_send_and_read(sock, "ATL0", 1000, &reply);
         elm_send_and_read(sock, "ATS0", 1000, &reply);
         elm_send_and_read(sock, "ATH0", 1000, &reply);
-        elm_send_and_read(sock, "ATSP0", 3000, &reply);
+        {
+            char sp[16];
+            snprintf(sp, sizeof(sp), "ATSP%d", g_proto_force);
+            log_file_printf("Protocolo: %s (%s)\n",
+                            g_proto_force ? "forzado" : "automatico", sp);
+            elm_send_and_read(sock, sp, 3000, &reply);
+        }
 
         elm_send_and_read(sock, "ATDPN", 2000, &reply);
         strncpy(g_proto, reply.text, sizeof(g_proto) - 1);
@@ -2708,34 +4348,43 @@ static int connect_network_and_elm(Target *targets, int *target_count,
         log_file_printf("Handshake: 0100 sin mascara, se reintenta\n");
     }
 
-    /* FASE F: un ELM327 recien alimentado puede responder 0100 con
-     * 00000000 mientras todavia esta fijando el protocolo. Antes se
-     * repetia la secuencia AT completa 2 veces y se seguia con 12 PIDs,
-     * es decir, con un dashboard incompleto. Se reintenta SOLO la
-     * mascara, con una pausa de 250 ms y un timeout mas corto, antes
-     * de rendirse. */
-    if (g_mask1 == 0) {
-        for (int extra = 0; extra < 2 && !g_connect_cancel; extra++) {
-            sceKernelDelayThread(250 * 1000);
-            elm_flush_input(sock);
-            elm_send_and_read(sock, "0100", 2000, &reply);
-            if (reply.data && reply.frame.data_len >= 4) {
-                g_mask1 = obd_pid_mask(reply.frame.data, reply.frame.data_len);
-            }
-            log_file_printf("mascara 0100 (reintento extra %d): %08X\n",
-                            extra + 1, (unsigned)g_mask1);
-            if (g_mask1 != 0) {
-                break;
-            }
-        }
-    }
-
     if (g_connect_cancel) {
         log_file_printf("Conexion cancelada por el usuario.\n");
         sceNetInetClose(sock);
         net_ui_set("CANCELADO");
         g_net_busy = 0;
         return -1;
+    }
+
+    /* Un ELM327 recien alimentado puede contestar 0100 con 00000000
+     * mientras fija el protocolo. Repetir la secuencia AT entera cuesta
+     * segundos; aqui se reintenta SOLO la mascara, dos veces y con una
+     * pausa corta, antes de arrancar con un dashboard incompleto
+     * (fase2.44 del repo original). */
+    if (g_mask1 == 0) {
+        for (int extra = 0; extra < 2 && !g_connect_cancel; extra++) {
+            /* La pausa se hace en trozos con connect_yield: asi el mando
+             * sigue vivo (SELECT cancela) y el aviso de la pantalla se
+             * mueve en vez de quedarse congelado 250 ms. */
+            for (int k = 0; k < 15 && !g_connect_cancel; k++) {
+                connect_yield();
+                sceKernelDelayThread(16 * 1000);
+            }
+            if (g_connect_cancel) {
+                break;
+            }
+            elm_flush_input(sock);
+            elm_send_and_read(sock, "0100", 2000, &reply);
+            if (reply.data && reply.frame.data_len >= 4) {
+                g_mask1 = obd_pid_mask(reply.frame.data,
+                                       reply.frame.data_len);
+            }
+            log_file_printf("mascara 0100 (reintento %d): %08X\n",
+                            extra + 1, (unsigned)g_mask1);
+            if (g_mask1 != 0) {
+                break;
+            }
+        }
     }
 
     if (g_mask1 == 0) {
@@ -2776,13 +4425,21 @@ static int connect_network_and_elm(Target *targets, int *target_count,
                     mito_encoding ? "MiTo (trims con signo, avance directo)"
                                   : "OBD estandar");
 
+    /* El protocolo se relee ANTES de identificar el coche y de repartir
+     * la tabla: justo despues de ATSP0 el adaptador contesta "A0"
+     * (automatico, protocolo aun sin detectar). El 0100 de arriba ya le
+     * obligo a elegir, asi que aqui A0 solo aparece si el coche no
+     * contesta a nada. Antes se releia despues, y por eso ningun perfil
+     * casaba nunca (ver vehicle_detect). */
+    scan_refresh_proto(sock, "conexion");
+
     build_scheduler();
 
-    /* ATDPN antes de la primera peticion OBD puede devolver "A0"
-     * (automatico, protocolo aun sin detectar). Se relee ya con el
-     * protocolo real para que el escaneo UDS y la restauracion usen
-     * el valor correcto. */
-    scan_refresh_proto(sock, "conexion");
+    /* La ventana de capacidad empieza de cero en cada conexion, y la
+     * primera no se mide (ver el bucle de sesion). */
+    g_cap_window_ms = 0;
+    g_cap_window_reqs = 0;
+    g_cap_warmup = 1;
 
     g_link_connected = 1;
     g_net_busy = 0;
@@ -2901,6 +4558,14 @@ static int scan_cancelled(void)
     SceCtrlData pad;
     memset(&pad, 0, sizeof(pad));
     sceCtrlReadBufferPositive(&pad, 1);
+
+    /* El escaneo y la sonda corren en su propio bucle, asi que sin esto el
+     * START mantenido no hacia nada durante los 30-60 s que duran: CIRCLE
+     * cancela y START mantenido sale de la app, como en el resto. */
+    exit_hold_tick(now_ms(), pad.Buttons);
+    if (g_exit_request) {
+        return 1;
+    }
     return (pad.Buttons & PSP_CTRL_CIRCLE) != 0;
 }
 
@@ -3497,7 +5162,16 @@ static void run_scan(int sock)
     scan_refresh_proto(sock, "escaneo");
     snprintf(g_scan_proto, sizeof(g_scan_proto), "%s", g_proto);
 
-    scan_uds(sock);
+    /* El sondeo UDS pide cabeceras CAN concretas (ATSH 7E0, 3E00, 22F1xx):
+     * en un coche de K-line eso no significa nada y ademas sale de lo que
+     * la app promete (01/02/03/06/07/09/0A y comandos AT). Ahi el escaneo
+     * se queda en las mascaras de OBD-II, que es lo que identifica a la
+     * centralita en ISO 9141-2. */
+    if (scan_can()) {
+        scan_uds(sock);
+    } else {
+        log_file_printf("Escaneo: K-line, sondeo UDS omitido\n");
+    }
 
     scan_status("RESTAURANDO ELM327");
     scan_restore(sock);
@@ -3529,11 +5203,15 @@ static void run_scan(int sock)
 typedef struct {
     char rpm[16];
     int rpm_valid;
-    float rpm_val;
+    float rpm_val;   /* suavizado para la aguja (ver sample_value_needle) */
+    float rpm_raw;   /* medida exacta: avisos y umbrales */
 
     char speed[16];
     int speed_valid;
     float speed_val;
+    int oilp_valid;  /* presion de aceite calculada (no hay sensor) */
+    float oilp_bar;
+    float speed_raw;
 
     char boost[24];
     int boost_valid;
@@ -3666,18 +5344,22 @@ static uint32_t data_age_ms(uint32_t now)
 /* FASE F2: umbrales de la edad del dato.
  *
  * OLD: a partir de aqui el contenido se atenua y la cabecera dice
- *      "DATOS VIEJOS". Con el RPM a ~330 ms son tres periodos, asi que
- *      no parpadea con un timeout puntual.
- * DEAD: a partir de aqui el dato ya no sirve y se muestra "SIN DATOS". */
-#define DATA_OLD_MS  1000u
-#define DATA_DEAD_MS 3000u
-
+ *      "DATOS VIEJOS".
+ * DEAD: a partir de aqui el dato ya no sirve y se muestra "SIN DATOS".
+ *
+ * Los dos se escalan con el hueco real entre muestras, no con una
+ * constante: en CAN un PID vuelve cada ~330 ms y 1000 ms de silencio ya
+ * es un aviso, pero en el K-line de la MX-5 cada peticion tarda 383 ms y
+ * el plan reparte quince PIDs, asi que un valor se refresca cada 1-2 s y
+ * el umbral fijo ponia el indicador a parpadear entre naranja y verde
+ * una vez por segundo, atenuando el panel entero. El suelo sigue siendo
+ * el de siempre, asi que un coche rapido no cambia de comportamiento. */
 static int data_is_stale(uint32_t now)
 {
     if (g_demo) {
         return 0;
     }
-    return data_age_ms(now) > DATA_DEAD_MS;
+    return data_age_ms(now) > data_old_ms() * 3u;
 }
 
 /* Historial por canal: cada elemento declara su PID de origen. Los
@@ -3720,9 +5402,11 @@ static void history_update(uint32_t now)
                 ok = 1;
             }
         } else if (i == W_THR) {
-            ok = sample_value(g_thr_pid, now, &v);
+            /* La grafica y los maximos son registro: medida cruda, nunca el
+             * valor suavizado de la aguja. */
+            ok = sample_value_raw(g_thr_pid, now, &v);
         } else {
-            ok = sample_value(g_hist_pid[i], now, &v);
+            ok = sample_value_raw(g_hist_pid[i], now, &v);
         }
 
         hist[g_hist_pos] = ok ? v : 0.0f;
@@ -4438,8 +6122,8 @@ static void draw_top_bar(int connected, int stale, uint32_t age_ms,
                          float iat, int iat_valid,
                          float volt, int volt_valid)
 {
-    /* La cabecera no se atenua: es donde vive el aviso, tiene que
-     * seguir leyendose siempre. */
+    /* La cabecera no se atenua: es donde vive el aviso de que el dato
+     * esta viejo, asi que tiene que seguir leyendose siempre. */
     int saved_dim = g_gfx_dim;
     g_gfx_dim = 100;
 
@@ -4447,21 +6131,37 @@ static void draw_top_bar(int connected, int stale, uint32_t age_ms,
     gfx_rect(0, 25, GFX_W, 1,
              theme_is_game() ? theme_accent() : QV_RED);
 
-    const char *tabs[MODE_COUNT] = {
-        tr("GENERAL"), tr("MOTOR"), tr("DIAG"),
-        tr("TELEM"), tr("MODULOS"), tr("SNIFFER"), tr("INFO")
-    };
-    static const int tab_x[MODE_COUNT] = { 6, 66, 110, 146, 190, 250, 310 };
 
-    for (int i = 0; i < MODE_COUNT; i++) {
-        uint32_t c = (g_mode == i) ? QV_TEXT : QV_DIM;
-        int x = tab_x[i];
-        gfx_text(x, 8, tabs[i], c, 1);
-        if (g_mode == i) {
-            gfx_rect((float)x, 20.0f,
-                     (float)gfx_text_width(tabs[i], 1), 2.0f,
-                     theme_is_game() ? theme_accent() : QV_RED);
+    static const int drive_mode[4] = { MODE_QV, MODE_ENGINE, MODE_MOTOR,
+                                       MODE_TELEMETRY };
+    static const int drive_x[4] = { 6, 80, 140, 196 };
+
+    /* Donde acaba el texto de la izquierda: el bloque derecho empieza
+     * despues y no antes. */
+    int left_end;
+    if (mode_is_driving(g_mode)) {
+        for (int i = 0; i < 4; i++) {
+            const char *name = mode_name(drive_mode[i]);
+            int x = drive_x[i];
+            gfx_text(x, 8, name,
+                     (g_mode == drive_mode[i]) ? QV_TEXT : QV_DIM, 1);
+            if (g_mode == drive_mode[i]) {
+                gfx_rect((float)x, 20.0f,
+                         (float)gfx_text_width(name, 1), 2.0f,
+                         theme_is_game() ? theme_accent() : QV_RED);
+            }
         }
+        left_end = drive_x[3] +
+                   gfx_text_width(mode_name(drive_mode[3]), 1);
+    } else {
+        /* En una herramienta la barra dice donde estas y como volver. */
+        int w = gfx_text_width(mode_name(g_mode), 1);
+        int wh = gfx_text_width(tr("HERRAMIENTAS"), 1);
+        int wb = gfx_text_width(tr("L/R: VOLVER"), 1);
+        gfx_text(6, 8, mode_name(g_mode), QV_TEXT, 1);
+        gfx_text(6 + w + 10, 8, tr("HERRAMIENTAS"), QV_DIM, 1);
+        gfx_text(6 + w + 10 + wh + 10, 8, tr("L/R: VOLVER"), QV_DIM, 1);
+        left_end = 6 + w + 10 + wh + 10 + wb;
     }
 
     uint32_t dot = QV_CRIT;
@@ -4487,7 +6187,7 @@ static void draw_top_bar(int connected, int stale, uint32_t age_ms,
             dot = QV_AMBER;
             state = tr("SIN DATOS");
             state_color = QV_AMBER;
-        } else if (age_ms >= DATA_OLD_MS) {
+        } else if (age_ms >= data_old_ms()) {
             /* FASE F2: el dato envejece. Se avisa en vez de dejar el
              * panel congelado sin explicacion. */
             dot = QV_AMBER;
@@ -4513,29 +6213,76 @@ static void draw_top_bar(int connected, int stale, uint32_t age_ms,
                  (unsigned)(session_s % 60u));
     }
 
-    /* FASE 2.12: aviso global, visible en cualquier pestaña. Se pone
-     * en el bloque derecho EN LUGAR del estado y el reloj: alli hay
-     * hueco (las pestañas terminan en x≈330 y el bloque derecho empieza
-     * en x≈360). Dibujarlo en x=16 tapaba GENERAL/MOTOR/DIAG. */
+    /* Aviso global del autor original (fase2.12): refrigerante por encima
+     * de 105/115 C, admision por encima de 70 C o bateria por debajo de
+     * 11,5 V. Se dibuja EN LUGAR del estado y el reloj, en el bloque
+     * derecho, donde hay hueco: a x=16 tapaba las pestañas. */
     obd_alert al = obd_alert_eval(ect, ect_valid, iat, iat_valid,
                                   volt, volt_valid);
     char righttop[40];
+    char rightalert[40];
+    int alert_on = (al.level != OBD_ALERT_NONE);
     uint32_t right_color = state_color;
 
-    if (al.level != OBD_ALERT_NONE &&
-        ((now_ms() / 500u) & 1u) == 0u) {
-        /* Medio segundo visible, medio oculto: el header se limpia
-         * cada frame, asi que no queda pintura antigua. */
-        snprintf(righttop, sizeof(righttop), "! %s%s",
+    snprintf(righttop, sizeof(righttop), "%s  %s", state, tb);
+    rightalert[0] = '\0';
+    if (alert_on) {
+        snprintf(rightalert, sizeof(rightalert), "! %s%s",
                  obd_alert_text(al.kind), al.more ? " +1" : "");
         right_color = (al.level == OBD_ALERT_CRIT) ? QV_CRIT : QV_AMBER;
+    }
+    /* El bloque se coloca por el aviso cuando lo hay, no por el reloj: si
+     * se colocara por el reloj, el parpadeo de 500 ms moveria de sitio la
+     * lampara MIL, que cuelga de right_x. */
+    int right_x = GFX_W - 8 -
+                  gfx_text_width(alert_on ? rightalert : righttop, 1);
+    /* El bloque derecho empieza donde acaba el de la izquierda. Con un
+     * limite fijo de 392 el estado no cabia nunca (la barra de cuatro
+     * pestanas acaba en 236) y la cabecera ensenaba solo el reloj, pintado
+     * con el color del estado y sin texto que lo explicase. Un aviso NO
+     * entra aqui: "! REFRIGERANTE" mide 112 px y tiene que verse siempre,
+     * que es justo el caso para el que existe. */
+    int right_limit = left_end + 8;
+    if (g_log_broken && right_limit < 396) {
+        /* SIN LOG se dibuja pegado a la izquierda del bloque: si el log no
+         * se puede abrir, ese aviso manda. */
+        right_limit = 396;
+    }
+    if (!alert_on && right_x < right_limit) {
+        /* No caben estado y reloj: manda el estado, que es lo que explica
+         * el color. */
+        snprintf(righttop, sizeof(righttop), "%s", state);
+        right_x = GFX_W - 8 - gfx_text_width(righttop, 1);
+        if (right_x < right_limit) {
+            snprintf(righttop, sizeof(righttop), "%s", tb);
+            right_x = GFX_W - 8 - gfx_text_width(righttop, 1);
+            right_color = state_color;
+        }
+    }
+    gfx_circle((float)(right_x - 9), 12.0f, 4.0f, dot);
+    if (alert_on) {
+        /* Medio segundo visible, medio oculto: la cabecera se repinta
+         * entera cada frame, asi que no queda pintura vieja. */
+        if (((now_ms() / 500u) & 1u) == 0u) {
+            gfx_text(right_x, 8, rightalert, right_color, 1);
+        }
     } else {
-        snprintf(righttop, sizeof(righttop), "%s  %s", state, tb);
+        gfx_text(right_x, 8, righttop, right_color, 1);
     }
 
-    int right_x = GFX_W - 8 - gfx_text_width(righttop, 1);
-    gfx_circle((float)(right_x - 9), 12.0f, 4.0f, dot);
-    gfx_text(right_x, 8, righttop, right_color, 1);
+    /* Lampara de averia: si se han leido los codigos y esta encendida se ve
+     * aqui, sin tener que entrar en FALLOS. Un N/D no es un aviso. */
+    if (g_dtc_mil == 1 && !g_log_broken) {
+        gfx_text(right_x - 8 - gfx_text_width("MIL", 1) - 10, 8, "MIL",
+                 QV_CRIT, 1);
+    }
+
+    /* Si el log no se puede abrir hay que decirlo: antes se perdian
+     * todas las lineas sin avisar. */
+    if (g_log_broken) {
+        gfx_text(392 - gfx_text_width("SIN LOG", 1), 8, "SIN LOG",
+                 QV_CRIT, 1);
+    }
 
     g_gfx_dim = saved_dim;
 }
@@ -4543,7 +6290,7 @@ static void draw_top_bar(int connected, int stale, uint32_t age_ms,
 static void draw_tacho(const dash_data *d, float x, float y, float w, float h)
 {
     qv_panel(x, y, w, h);
-    gfx_text((int)x + 10, (int)y + 7, "TACOMETRO", QV_DIM, 1);
+    gfx_text((int)x + 10, (int)y + 7, tr("TACOMETRO"), QV_DIM, 1);
 
     float cx = x + w * 0.5f;
     float cy = y + h * 0.5f + 7.0f;
@@ -4557,28 +6304,38 @@ static void draw_tacho(const dash_data *d, float x, float y, float w, float h)
         (redline_rpm() / tach_max_rpm());
     theme_redline(cx, cy, r, red_start, 405.0f);
 
+    /* El numero grande va en la esfera, debajo de la aguja: es una cifra
+     * impresa en el cuadro, no un cartel encima de la aguja. Antes se
+     * pintaba despues y la aguja desaparecia por debajo al pasar. */
+    /* En los temas de juego theme_hub() se pinta despues y con el numero a
+     * cy-16 mordia las ultimas filas de las cifras centrales: cuatro
+     * pixeles mas arriba en esos temas, y solo en ellos. */
+    int num_dy = theme_is_game() ? 20 : 16;
+    if (d->rpm_valid) {
+        gfx_text_center((int)cx, (int)cy - num_dy, d->rpm, QV_TEXT, 3);
+    } else {
+        gfx_text_center((int)cx, (int)cy - (num_dy - 4), "N/D", QV_DIM, 3);
+    }
+
     if (d->rpm_valid) {
         float ratio = clamp_float(d->rpm_val / tach_max_rpm(), 0.0f, 1.0f);
         uint32_t c = QV_TEXT;
-        if (d->rpm_val >= redline_rpm()) {
+        if (d->rpm_raw >= redline_rpm()) {
             c = QV_RED;
-        } else if (d->rpm_val >= redline_rpm() - 300.0f) {
+        } else if (d->rpm_raw >= redline_rpm() - 300.0f) {
             c = QV_AMBER;
         }
-        if (g_cfg.shift_rpm > 0 && d->rpm_val >= (float)g_cfg.shift_rpm) {
+        if (g_cfg.shift_rpm > 0 && d->rpm_raw >= (float)g_cfg.shift_rpm) {
             c = QV_RED;
         }
         theme_value(cx, cy, r, 135.0f + 270.0f * ratio, c, 6.0f);
         theme_needle(cx, cy, r, ratio, theme_is_game() ? theme_accent() : c);
         theme_hub(cx, cy, theme_accent());
-        gfx_text_center((int)cx, (int)cy - 16, d->rpm, QV_TEXT, 3);
 
-        if (g_cfg.shift_rpm > 0 && d->rpm_val >= (float)g_cfg.shift_rpm) {
+        if (g_cfg.shift_rpm > 0 && d->rpm_raw >= (float)g_cfg.shift_rpm) {
             int sy = theme_is_game() ? 50 : 34;
             gfx_text_center((int)cx, (int)cy + sy, "SHIFT", QV_RED, 1);
         }
-    } else {
-        gfx_text_center((int)cx, (int)cy - 12, "N/D", QV_DIM, 3);
     }
 
     /* Remate inferior propio del tema. */
@@ -4633,7 +6390,7 @@ static void draw_tacho(const dash_data *d, float x, float y, float w, float h)
 static void draw_speed(const dash_data *d, float x, float y, float w, float h)
 {
     qv_panel(x, y, w, h);
-    gfx_text((int)x + 10, (int)y + 7, "VELOCIDAD", QV_DIM, 1);
+    gfx_text((int)x + 10, (int)y + 7, tr("VELOCIDAD"), QV_DIM, 1);
 
     if (d->speed_valid) {
         gfx_text((int)x + 10, (int)y + 22, d->speed, QV_TEXT, 5);
@@ -4858,7 +6615,7 @@ static const char *o2_state_str(float v)
 static void widget_view_fill(const dash_data *d, int item, widget_view *wv)
 {
     memset(wv, 0, sizeof(*wv));
-    wv->label = (item >= 0 && item < W_COUNT) ? g_widget_names[item] : "";
+    wv->label = widget_name(item);
     wv->unit = "";
     wv->color = QV_TEXT;
     wv->fill = QV_GREEN;
@@ -4867,6 +6624,14 @@ static void widget_view_fill(const dash_data *d, int item, widget_view *wv)
     snprintf(wv->value, sizeof(wv->value), "N/D");
 
     switch (item) {
+    case W_AUX:
+        /* Se pinta entero en draw_aux(); aqui solo hace falta que el
+         * editor lo nombre y que no herede una unidad ajena. */
+        wv->label = "BLOQUE";
+        wv->unit = "";
+        wv->valid = 1;
+        snprintf(wv->value, sizeof(wv->value), "--");
+        break;
     case W_RPM:
         wv->label = "RPM";
         wv->unit = "rpm";
@@ -4877,17 +6642,39 @@ static void widget_view_fill(const dash_data *d, int item, widget_view *wv)
             snprintf(wv->value, sizeof(wv->value), "%s", d->rpm);
             wv->valid = 1;
             wv->ratio = clamp_float(d->rpm_val / tach_max_rpm(), 0.0f, 1.0f);
-            if (d->rpm_val >= redline_rpm()) {
+            if (d->rpm_raw >= redline_rpm()) {
                 wv->color = QV_RED;
-            } else if (d->rpm_val >= redline_rpm() - 300.0f) {
+            } else if (d->rpm_raw >= redline_rpm() - 300.0f) {
                 wv->color = QV_AMBER;
             }
             if (g_cfg.shift_rpm > 0 &&
-                d->rpm_val >= (float)g_cfg.shift_rpm) {
+                d->rpm_raw >= (float)g_cfg.shift_rpm) {
                 wv->color = QV_RED;
             }
         }
         break;
+
+    case W_GEAR: {
+        /* La marcha sale de rpm y velocidad, con las relaciones del perfil
+         * del coche. Sin perfil, o parado, N/D: no se adivina. */
+        wv->label = "MARCHA";
+        wv->unit = "";
+        wv->fill = QV_CYAN;
+        const obd_vehicle_profile *vp = obd_vehicle_by_id(g_vehicle_id);
+        int gear = 0;
+        if (vp != NULL && d->rpm_valid && d->speed_valid) {
+            /* Con la medida exacta: la aguja va adelantada, y con
+             * aceleracion fuerte el cociente se sale del 10 % que
+             * obd_vehicle_gear deja pasar, asi que la marcha desaparecia
+             * justo al acelerar. */
+            gear = obd_vehicle_gear(vp->gear_kmh, d->rpm_raw, d->speed_raw);
+        }
+        if (gear > 0) {
+            snprintf(wv->value, sizeof(wv->value), "%d", gear);
+            wv->valid = 1;
+        }
+        break;
+    }
 
     case W_SPEED:
         wv->label = "VELOCIDAD";
@@ -5176,10 +6963,61 @@ static void draw_widget_bar(float x, float y, float w, float h,
     }
 }
 
+/* Bloque del GENERAL de la MX-5: aire, presion de aceite calculada y
+ * agua en una casilla estrecha. Tres filas iguales. */
+static void draw_aux(const dash_data *d, float x, float y, float w, float h)
+{
+    qv_panel(x, y, w, h);
+    char buf[32];
+
+    if (h < 120.0f) {
+        /* Hueco pequeno (una tarjeta vieja o una mano en settings.txt): se
+         * pinta una sola linea en vez de tres filas pisadas. */
+        snprintf(buf, sizeof(buf), "%s %s",
+                 d->maf_valid ? d->maf : "N/D", units_maf_name());
+        gfx_text((int)x + 8, (int)(y + h * 0.5f) - 4, "BLOQUE", QV_DIM, 1);
+        gfx_text((int)x + 8, (int)(y + h * 0.5f) + 6, buf, QV_TEXT, 1);
+        return;
+    }
+
+    const float row = h / 3.0f;
+
+    gfx_text((int)x + 8, (int)y + 4, "MAF", QV_DIM, 1);
+    gfx_text((int)x + 8, (int)y + 16,
+             d->maf_valid ? d->maf : "N/D",
+             d->maf_valid ? QV_TEXT : QV_DIM, 2);
+    gfx_text((int)x + 8, (int)y + 34, units_maf_name(), QV_DIM, 1);
+
+    float y2 = y + row;
+    gfx_text((int)x + 8, (int)y2 + 4, "ACEITE", QV_DIM, 1);
+    /* Es una estimacion y se dice: nunca se pinta como si fuera el sensor. */
+    gfx_text_right((int)(x + w) - 6, (int)y2 + 4, "EST", QV_AMBER, 1);
+    if (d->oilp_valid) {
+        fmt_1(buf, sizeof(buf), d->oilp_bar);
+    } else {
+        snprintf(buf, sizeof(buf), "N/D");
+    }
+    gfx_text((int)x + 8, (int)y2 + 16, buf,
+             d->oilp_valid ? QV_TEXT : QV_DIM, 2);
+    gfx_text((int)x + 8, (int)y2 + 34, "bar", QV_DIM, 1);
+
+    float y3 = y + row * 2.0f;
+    gfx_text((int)x + 8, (int)y3 + 4, "AGUA", QV_DIM, 1);
+    gfx_text((int)x + 8, (int)y3 + 16,
+             d->ect_valid ? d->ect : "N/D",
+             d->ect_valid ? QV_TEXT : QV_DIM, 2);
+    gfx_text((int)x + 8, (int)y3 + 34, units_temp_name(), QV_DIM, 1);
+}
+
 static void draw_dash_widget(const dash_data *d, int item, int style,
                              float x, float y, float w, float h)
 {
     if (style == STYLE_OFF || item == W_OFF) {
+        return;
+    }
+
+    if (item == W_AUX) {
+        draw_aux(d, x, y, w, h);
         return;
     }
 
@@ -5215,20 +7053,43 @@ static void draw_dash_widget(const dash_data *d, int item, int style,
     }
 }
 
+/* Geometria del GENERAL. La del coche con MAP es la de siempre: dial
+ * grande, tira ancha de velocidad y barra de boost. La del coche sin MAP
+ * (MX-5) parte el mismo hueco de la derecha en un dial de velocidad
+ * cuadrado y el bloque de aire/aceite/agua, sin mover nada mas. */
+static void qv_rect(int i, float out[4])
+{
+    static const float fx[DASH_SLOTS] = {  8.0f, 228.0f, 228.0f,
+                                           8.0f, 168.0f, 328.0f };
+    static const float fy[DASH_SLOTS] = { 32.0f,  32.0f, 104.0f,
+                                         186.0f, 186.0f, 186.0f };
+    static const float fw[DASH_SLOTS] = { 212.0f, 244.0f, 244.0f,
+                                          152.0f, 152.0f, 144.0f };
+    static const float fh[DASH_SLOTS] = { 146.0f,  64.0f,  74.0f,
+                                           80.0f,  80.0f,  80.0f };
+    /* MX-5: el mismo hueco (228..472 x 32..178) repartido en 124 + 116. */
+    static const float mx[DASH_SLOTS] = {  8.0f, 228.0f, 356.0f,
+                                           8.0f, 168.0f, 328.0f };
+    static const float my[DASH_SLOTS] = { 32.0f,  32.0f,  32.0f,
+                                         186.0f, 186.0f, 186.0f };
+    static const float mw[DASH_SLOTS] = { 212.0f, 124.0f, 116.0f,
+                                          152.0f, 152.0f, 144.0f };
+    static const float mh[DASH_SLOTS] = { 146.0f, 146.0f, 146.0f,
+                                           80.0f,  80.0f,  80.0f };
+    int maf = (g_vehicle_centre == OBD_CENTRE_MAF);
+    out[0] = maf ? mx[i] : fx[i];
+    out[1] = maf ? my[i] : fy[i];
+    out[2] = maf ? mw[i] : fw[i];
+    out[3] = maf ? mh[i] : fh[i];
+}
+
 static void draw_qv(const dash_data *d)
 {
-    static const float rx[DASH_SLOTS] = {  8.0f, 228.0f, 228.0f,
-                                           8.0f, 168.0f, 328.0f };
-    static const float ry[DASH_SLOTS] = { 32.0f,  32.0f, 104.0f,
-                                         186.0f, 186.0f, 186.0f };
-    static const float rw[DASH_SLOTS] = { 212.0f, 244.0f, 244.0f,
-                                          152.0f, 152.0f, 144.0f };
-    static const float rh[DASH_SLOTS] = { 146.0f,  64.0f,  74.0f,
-                                           80.0f,  80.0f,  80.0f };
-
     for (int i = 0; i < DASH_SLOTS; i++) {
-        draw_dash_widget(d, g_slot_item[i], g_slot_style[i],
-                         rx[i], ry[i], rw[i], rh[i]);
+        float r[4];
+        qv_rect(i, r);
+        draw_dash_widget(d, slot_item_eff(i), slot_style_eff(i),
+                         r[0], r[1], r[2], r[3]);
     }
 }
 
@@ -5248,19 +7109,22 @@ static void draw_engine(const dash_data *d)
     if (g_map_supported) {
         tiles[n].label = "MAP"; tiles[n].value = d->map_valid ? d->map_kpa : "N/D";
         tiles[n].unit = units_imperial() ? "psi ABS" : "kPa ABS";
-        tiles[n].color = d->map_valid ? tile_color(0x0B, now, QV_TEXT) : QV_DIM;
+        tiles[n].color = d->map_valid ? tile_color(0x0B, now, QV_TEXT)
+                                      : QV_DIM;
         tiles[n].valid = d->map_valid; n++;
     } else if (g_maf_supported) {
         tiles[n].label = "MAF"; tiles[n].value = d->maf_valid ? d->maf : "N/D";
         tiles[n].unit = units_maf_name();
-        tiles[n].color = d->maf_valid ? tile_color(0x10, now, QV_TEXT) : QV_DIM;
+        tiles[n].color = d->maf_valid ? tile_color(0x10, now, QV_TEXT)
+                                      : QV_DIM;
         tiles[n].valid = d->maf_valid; n++;
     }
 
     if (g_map_supported) {
         tiles[n].label = "BOOST"; tiles[n].value = bval;
         tiles[n].unit = units_press_name();
-        tiles[n].color = d->boost_valid ? tile_color(0x0B, now, QV_TEXT) : QV_DIM;
+        tiles[n].color = d->boost_valid ? tile_color(0x0B, now, QV_TEXT)
+                                        : QV_DIM;
         tiles[n].valid = d->boost_valid; n++;
     }
 
@@ -5276,7 +7140,8 @@ static void draw_engine(const dash_data *d)
 
     tiles[n].label = g_thr_label; tiles[n].value = d->thr_valid ? d->thr : "N/D";
     tiles[n].unit = "%";
-    tiles[n].color = d->thr_valid ? tile_color(g_thr_pid, now, QV_TEXT) : QV_DIM;
+    tiles[n].color = d->thr_valid ? tile_color(g_thr_pid, now, QV_TEXT)
+                                  : QV_DIM;
     tiles[n].valid = d->thr_valid; n++;
 
     if (d->load_valid) {
@@ -5289,27 +7154,31 @@ static void draw_engine(const dash_data *d)
     if (g_pedal_supported) {
         tiles[n].label = "MARIPOSA"; tiles[n].value = d->plate_valid ? d->plate : "N/D";
         tiles[n].unit = "%";
-        tiles[n].color = d->plate_valid ? tile_color(0x0D, now, QV_TEXT) : QV_DIM;
+        tiles[n].color = d->plate_valid ? tile_color(0x11, now, QV_TEXT)
+                                        : QV_DIM;
         tiles[n].valid = d->plate_valid; n++;
     }
 
     if (g_mask3 & 0x40000000u) {
         tiles[n].label = "VOLT"; tiles[n].value = d->volt_valid ? d->volt : "N/D";
         tiles[n].unit = "V";
-        tiles[n].color = d->volt_valid ? tile_color(0x42, now, QV_TEXT) : QV_DIM;
+        tiles[n].color = d->volt_valid ? tile_color(0x42, now, QV_TEXT)
+                                       : QV_DIM;
         tiles[n].valid = d->volt_valid; n++;
     }
 
     if (g_oil_supported && d->oil_valid) {
         tiles[n].label = "ACEITE"; tiles[n].value = d->oil;
         tiles[n].unit = units_temp_name();
-        tiles[n].color = tile_color(0x5C, now, QV_TEXT); tiles[n].valid = 1; n++;
+        tiles[n].color = tile_color(0x5C, now, QV_TEXT);
+        tiles[n].valid = 1; n++;
     }
 
     if (g_fuel_supported && d->fuel_valid) {
         tiles[n].label = "COMBUSTIBLE"; tiles[n].value = d->fuel;
         tiles[n].unit = "%";
-        tiles[n].color = tile_color(0x2F, now, QV_TEXT); tiles[n].valid = 1; n++;
+        tiles[n].color = tile_color(0x2F, now, QV_TEXT);
+        tiles[n].valid = 1; n++;
     }
 
     int m = 0;
@@ -5320,7 +7189,7 @@ static void draw_engine(const dash_data *d)
     n = m;
 
     if (n == 0) {
-        gfx_text(16, 64, "Sin datos del motor.", QV_DIM, 1);
+        gfx_text(16, 64, tr("Sin datos del motor."), QV_DIM, 1);
         return;
     }
 
@@ -5354,49 +7223,48 @@ static void draw_engine(const dash_data *d)
 
 static void draw_motor(const dash_data *d)
 {
-    uint32_t now = now_ms();
     struct { const char *label; const char *value; const char *unit;
              uint32_t color; int valid; } tiles[8];
     int n = 0;
 
     if (d->stft_valid) {
         tiles[n].label = "STFT"; tiles[n].value = d->stft;
-        tiles[n].unit = "%"; tiles[n].color = tile_color(0x06, now, QV_TEXT); tiles[n].valid = 1; n++;
+        tiles[n].unit = "%"; tiles[n].color = QV_TEXT; tiles[n].valid = 1; n++;
     }
     if (d->ltft_valid) {
         tiles[n].label = "LTFT"; tiles[n].value = d->ltft;
-        tiles[n].unit = "%"; tiles[n].color = tile_color(0x07, now, QV_TEXT); tiles[n].valid = 1; n++;
+        tiles[n].unit = "%"; tiles[n].color = QV_TEXT; tiles[n].valid = 1; n++;
     }
     if (d->timing_valid) {
         tiles[n].label = "AVANCE"; tiles[n].value = d->timing;
-        tiles[n].unit = "deg"; tiles[n].color = tile_color(0x0E, now, QV_AMBER); tiles[n].valid = 1; n++;
+        tiles[n].unit = "deg"; tiles[n].color = QV_AMBER; tiles[n].valid = 1; n++;
     }
     if (d->o2_1_valid) {
         tiles[n].label = "O2-1"; tiles[n].value = d->o2_1;
         tiles[n].unit = o2_state_str(d->o2_1_val);
-        tiles[n].color = tile_color(0x14, now, QV_GREEN); tiles[n].valid = 1; n++;
+        tiles[n].color = QV_GREEN; tiles[n].valid = 1; n++;
     }
     if (d->o2_2_valid) {
         tiles[n].label = "O2-2"; tiles[n].value = d->o2_2;
         tiles[n].unit = o2_state_str(d->o2_2_val);
-        tiles[n].color = tile_color(0x15, now, QV_GREEN); tiles[n].valid = 1; n++;
+        tiles[n].color = QV_GREEN; tiles[n].valid = 1; n++;
     }
     if (d->fuel_valid) {
         tiles[n].label = "COMBUSTIBLE"; tiles[n].value = d->fuel;
-        tiles[n].unit = "%"; tiles[n].color = tile_color(0x2F, now, QV_TEXT); tiles[n].valid = 1; n++;
+        tiles[n].unit = "%"; tiles[n].color = QV_TEXT; tiles[n].valid = 1; n++;
     }
     if (d->volt_valid) {
         tiles[n].label = "VOLT"; tiles[n].value = d->volt;
-        tiles[n].unit = "V"; tiles[n].color = tile_color(0x42, now, QV_TEXT); tiles[n].valid = 1; n++;
+        tiles[n].unit = "V"; tiles[n].color = QV_TEXT; tiles[n].valid = 1; n++;
     }
     if (d->dist_mil_valid) {
         tiles[n].label = "MIL"; tiles[n].value = d->dist_mil;
-        tiles[n].unit = "km"; tiles[n].color = tile_color(0x21, now, QV_AMBER); tiles[n].valid = 1; n++;
+        tiles[n].unit = "km"; tiles[n].color = QV_AMBER; tiles[n].valid = 1; n++;
     }
 
     if (n == 0) {
-        gfx_text(16, 64, "Sin datos avanzados soportados.", QV_DIM, 1);
-        gfx_text(16, 84, "Comprueba el contacto y la conexion.", QV_DIM, 1);
+        gfx_text(16, 64, tr("Sin datos avanzados soportados."), QV_DIM, 1);
+        gfx_text(16, 84, tr("Comprueba el contacto y la conexion."), QV_DIM, 1);
         return;
     }
 
@@ -5456,7 +7324,8 @@ static void graph_series(const float *hist, float lo, float hi, uint32_t bit,
     }
     int start = (g_hist_count < HIST_MAX) ? 0 : g_hist_pos;
     int prev_valid = 0;
-    float prev_x = 0.0f, prev_y = 0.0f;
+    float px_draw = 0.0f, py_draw = 0.0f;
+    float y0 = 0.0f, y1 = 0.0f;
 
     for (int k = 0; k < g_hist_count; k++) {
         int idx = (start + k) % HIST_MAX;
@@ -5469,11 +7338,27 @@ static void graph_series(const float *hist, float lo, float hi, uint32_t bit,
         if (v > hi) v = hi;
         float x = gx + gw * (float)k / (float)(g_hist_count - 1);
         float y = gy + gh - (v - lo) / (hi - lo) * gh;
-        if (prev_valid) {
-            gfx_line(prev_x, prev_y, x, y, 2.0f, color);
+        /* Primer punto de un tramo: la ventana arranca en el, no en cero.
+         * Sin esto el primer segmento salia de y/4, un pico fuera del panel
+         * en el borde izquierdo de cada serie y en cada fotograma. */
+        if (!prev_valid) {
+            y0 = y;
+            y1 = y;
         }
-        prev_x = x;
-        prev_y = y;
+
+        /* Media movil sobre la linea, no sobre el registro: los numeros de
+         * las casillas siguen siendo la medida, pero el trazo deja de salir
+         * a dientes de sierra. Cada punto se dibuja a la media de los tres
+         * ultimos (el anterior, el actual y el siguiente, que aqui se lee
+         * como [k-1], [k] y [k+1] desplazados un punto). */
+        float y3 = (y0 + 2.0f * y1 + y) * 0.25f;
+        if (prev_valid) {
+            gfx_line(px_draw, py_draw, x, y3, 2.0f, color);
+        }
+        y0 = y1;
+        y1 = y;
+        px_draw = x;
+        py_draw = y3;
         prev_valid = 1;
     }
 }
@@ -5521,11 +7406,17 @@ static int pid_supported(uint8_t pid)
     if (pid >= 0x01 && pid <= 0x20) {
         return g_mask1 != 0 && obd_mask_supports(g_mask1, pid);
     }
+    /* obd_mask_supports indexa 1..32 dentro de su bloque: pasarle el PID
+     * global hacia que tension, combustible, baro y MIL no se pudieran
+     * elegir nunca, aunque la ECU los declarase (el MiTo declara 0x42,
+     * 0x2F y 0x33). */
     if (pid >= 0x21 && pid <= 0x40) {
-        return g_mask2 != 0 && obd_mask_supports(g_mask2, pid);
+        return g_mask2 != 0 &&
+               obd_mask_supports(g_mask2, (uint8_t)(pid - 0x20));
     }
     if (pid >= 0x41 && pid <= 0x60) {
-        return g_mask3 != 0 && obd_mask_supports(g_mask3, pid);
+        return g_mask3 != 0 &&
+               obd_mask_supports(g_mask3, (uint8_t)(pid - 0x40));
     }
     return 0;
 }
@@ -5549,9 +7440,11 @@ static int widget_available(int item)
 
     switch (item) {
     case W_RPM:   return 1;
+    case W_GEAR:  return 1;
     case W_BOOST: return g_map_supported;
     case W_MAP:   return g_map_supported;
     case W_MAF:   return g_maf_supported;
+    case W_AUX:   return g_maf_supported;
     case W_PLATE: return g_pedal_supported;
     case W_OIL:   return g_oil_supported;
     case W_FUEL:  return g_fuel_supported;
@@ -5576,6 +7469,11 @@ static int widget_cycle(int item, int dir, int include_off)
             ni += n;
         }
         int cand = ni + lo;
+        /* BLOQUE solo lo pone el coche, en su hueco de 146 px: en un
+         * hueco pequeno las tres filas se pisan. */
+        if (cand == W_AUX) {
+            continue;
+        }
         if (cand == W_OFF || widget_available(cand)) {
             return cand;
         }
@@ -5643,7 +7541,7 @@ static const char *tel_name(int item)
     case W_SPEED: return "VELOCIDAD";
     case W_THR:   return "ACELERADOR";
     default:
-        return (item >= 0 && item < W_COUNT) ? g_widget_names[item] : "";
+        return widget_name(item);
     }
 }
 
@@ -5658,7 +7556,7 @@ static const char *tel_short(int item)
     case W_FUEL:     return "COMB";
     case W_TIMING:   return "AVZ";
     default:
-        return (item >= 0 && item < W_COUNT) ? g_widget_names[item] : "";
+        return widget_name(item);
     }
 }
 
@@ -5743,10 +7641,11 @@ static void draw_tel_stat(int item, float x, float y, float w, float h)
         return;
     }
 
+    /* "AVZ MAX" cabe en 88 px y deja claro que el numero grande es el
+     * maximo de la sesion; la unidad va en la linea del minimo. */
     char title[28];
-    snprintf(title, sizeof(title), "%s MAX %s", tel_short(item),
-             tel_unit(item));
-    gfx_text((int)x + 8, (int)y + 6, title, QV_DIM, 1);
+    snprintf(title, sizeof(title), "%s MAX", tel_short(item));
+    gfx_text((int)x + 6, (int)y + 4, title, QV_DIM, 1);
 
     float mn, mx;
     int n;
@@ -5757,13 +7656,29 @@ static void draw_tel_stat(int item, float x, float y, float w, float h)
 
     if (n > 0) {
         tel_print(item, mx, buf, sizeof(buf));
-        gfx_text((int)x + 8, (int)y + 20, buf,
-                 tel_color(item), 2);
+        /* Con seis caracteres ("+11.50", "-12.50") a escala 2 no cabe en 88
+         * px: la casilla se queda sin margen y la ultima se sale. */
+        int big = (strlen(buf) <= 5) ? 2 : 1;
+        gfx_text((int)x + 6, (int)y + 20, buf, tel_color(item), big);
         tel_print(item, mn, small, sizeof(small));
-        gfx_text((int)x + 8, (int)y + h - 12, "MIN", QV_DIM, 1);
-        gfx_text((int)x + 40, (int)y + h - 12, small, QV_DIM, 1);
+        char minline[28];
+        snprintf(minline, sizeof(minline), "%s %s", tr("MIN"),
+                 tel_unit(item));
+        /* El valor va detras de la etiqueta medida: con x fija, "MIN rpm"
+         * (56 px) se comia el primer caracter del numero y "MIN lb/min"
+         * casi todo. Si etiqueta y valor no caben juntos en 88 px, la
+         * etiqueta se queda en "MIN" y la unidad se cae. */
+        float lw = (float)gfx_text_width(minline, 1);
+        float vw = (float)gfx_text_width(small, 1);
+        if (lw + 4.0f + vw > 76.0f) {
+            snprintf(minline, sizeof(minline), "%s", tr("MIN"));
+            lw = (float)gfx_text_width(minline, 1);
+        }
+        gfx_text((int)x + 6, (int)y + h - 12, minline, QV_DIM, 1);
+        gfx_text((int)(x + 6.0f + lw + 4.0f), (int)y + h - 12, small,
+                 QV_TEXT, 1);
     } else {
-        gfx_text((int)x + 8, (int)y + 20, "N/D", QV_DIM, 2);
+        gfx_text((int)x + 6, (int)y + 20, "N/D", QV_DIM, 2);
     }
 }
 static void draw_telemetry(void)
@@ -5774,18 +7689,30 @@ static void draw_telemetry(void)
     float ph = 158.0f;
 
     qv_panel(px, py, pw, ph);
-    gfx_text((int)px + 10, (int)py + 8, "TELEMETRIA", QV_DIM, 1);
-    gfx_text((int)px + 96, (int)py + 8, "X: ELEGIR SERIES", QV_DIM, 1);
+    gfx_text((int)px + 10, (int)py + 8, tr("TELEMETRIA"), QV_DIM, 1);
+    gfx_text((int)px + 98, (int)py + 8, tr("X: SERIES"), QV_DIM, 1);
 
-    /* Leyenda: solo las series que el usuario haya activado. */
-    for (int i = 0; i < TEL_SLOTS; i++) {
-        int item = g_tel_item[i];
-        if (item == W_OFF) {
-            continue;
+    /* Leyenda: un color y un nombre corto por serie activa. Cada entrada
+     * ocupa lo que mide su texto mas el cuadro de color: con un paso fijo
+     * de 56 px los nombres largos se pisaban entre ellos y con la etiqueta
+     * de serie de la esquina, que es la mitad de la ilegibilidad de esta
+     * pantalla. */
+    {
+        float lx = px + 196.0f;
+        for (int i = 0; i < TEL_SLOTS; i++) {
+            int item = tel_item_eff(i);
+            if (item == W_OFF) {
+                continue;
+            }
+            const char *nm = tel_short(item);
+            float w = 8.0f + 4.0f + (float)gfx_text_width(nm, 1) + 6.0f;
+            if (lx + w > px + pw - 8.0f) {
+                break;
+            }
+            gfx_rect(lx, py + 9.0f, 8.0f, 8.0f, tel_color(item));
+            gfx_text((int)lx + 12, (int)py + 8, nm, QV_TEXT, 1);
+            lx += w;
         }
-        float lx = px + 196.0f + (float)i * 56.0f;
-        gfx_rect(lx, py + 9.0f, 8.0f, 8.0f, tel_color(item));
-        gfx_text((int)lx + 11, (int)py + 8, tel_short(item), QV_DIM, 1);
     }
 
     float gx = px + 12.0f;
@@ -5800,7 +7727,7 @@ static void draw_telemetry(void)
     gfx_rect(gx, gy + gh - 1.0f, gw, 1.0f, QV_TRACK);
 
     for (int i = 0; i < TEL_SLOTS; i++) {
-        int item = g_tel_item[i];
+        int item = tel_item_eff(i);
         if (item == W_OFF) {
             continue;
         }
@@ -5817,7 +7744,7 @@ static void draw_telemetry(void)
         8.0f, 102.0f, 196.0f, 290.0f, 384.0f
     };
     for (int i = 0; i < TEL_SLOTS; i++) {
-        draw_tel_stat(g_tel_item[i], sx[i], 196.0f, 88.0f, 70.0f);
+        draw_tel_stat(tel_item_eff(i), sx[i], 196.0f, 88.0f, 70.0f);
     }
 }
 
@@ -5834,7 +7761,12 @@ static void draw_settings_overlay(void)
     const float w = 464.0f;
     const float h = 238.0f;
     const int items = SET_COUNT;
-    const int per_col = 9;
+    /* Once filas por columna, no diez: con veintiuna filas, el paso de 16
+     * px las mete todas en dos columnas y SALIR sigue a la vista (con diez
+     * por columna caia en una tercera columna que empieza en x=472 sobre
+     * una pantalla de 480, existia en la lista y no se veia nunca). */
+    const int per_col = 11;
+    const float pitch = 16.0f;
     const float colw = 218.0f;
 
     /* Sombra y panel. */
@@ -5850,12 +7782,12 @@ static void draw_settings_overlay(void)
         int col = i / per_col;
         int row = i % per_col;
         float cx = x + 12.0f + (float)col * (colw + 8.0f);
-        float ry = y + 42.0f + (float)row * 19.0f;
+        float ry = y + 42.0f + (float)row * pitch;
         int selected = (g_settings_sel == i);
 
         if (selected) {
-            gfx_rect(cx - 2.0f, ry - 4.0f, colw, 17.0f, QV_PANEL);
-            gfx_rect(cx - 2.0f, ry - 4.0f, 3.0f, 17.0f, QV_RED);
+            gfx_rect(cx - 2.0f, ry - 4.0f, colw, 15.0f, QV_PANEL);
+            gfx_rect(cx - 2.0f, ry - 4.0f, 3.0f, 15.0f, QV_RED);
         }
 
         const char *label = "";
@@ -5876,7 +7808,9 @@ static void draw_settings_overlay(void)
                      g_contrast_names[g_cfg.contrast]);
         } else if (i == 3) {
             label = tr("ANIMACION");
-            snprintf(value, sizeof(value), "%s", g_cfg.anim ? "SI" : "NO");
+            snprintf(value, sizeof(value), "%s",
+                     g_cfg.anim == 0 ? tr("NO")
+                                     : (g_cfg.anim == 1 ? "MITO" : "MX-5"));
         } else if (i == 4) {
             label = tr("MUESTREO");
             snprintf(value, sizeof(value), "%s",
@@ -5925,9 +7859,41 @@ static void draw_settings_overlay(void)
             snprintf(value, sizeof(value), "%s",
                      g_cfg.show_fps ? "SI" : "NO");
         } else if (i == 15) {
+            label = tr("PANTALLA INICIAL");
+            snprintf(value, sizeof(value), "%s",
+                     (g_start_mode < 0) ? tr("ULTIMA")
+                                        : mode_name(g_start_mode));
+        } else if (i == 16) {
             label = "DEBUG";
             snprintf(value, sizeof(value), "%s",
                      g_cfg.debug ? "SI" : "NO");
+        } else if (i == 17) {
+            /* Tres estados: sin archivo, la sesion, o cada peticion. */
+            label = "LOG";
+            if (g_cfg.log <= 0) {
+                snprintf(value, sizeof(value), "%s", tr("NO"));
+            } else if (g_cfg.log == 1) {
+                snprintf(value, sizeof(value), "%s", tr("SESION"));
+            } else {
+                snprintf(value, sizeof(value), "%s", tr("COMPLETO"));
+            }
+        } else if (i == SET_NEEDLE) {
+            label = tr("AGUJA");
+            snprintf(value, sizeof(value), "%s",
+                     g_cfg.needle <= 0 ? tr("DIRECTA")
+                                       : (g_cfg.needle >= 2 ? tr("MUY SUAVE")
+                                                            : tr("SUAVE")));
+        } else if (i == SET_SPLIT) {
+            label = tr("REPARTO");
+            if (g_cfg.split_values <= 0) {
+                /* No es "solo RPM": los cuadros siguen vivos, solo que
+                 * fuera del cupo rapido. */
+                snprintf(value, sizeof(value), "%s", tr("SIN CUPO"));
+            } else {
+                snprintf(value, sizeof(value), "%d %s", g_cfg.split_values,
+                         g_cfg.split_values == 1 ? tr("VALOR")
+                                                 : tr("VALORES"));
+            }
         } else {
             label = tr("SALIR");
             snprintf(value, sizeof(value), "CERRAR APP");
@@ -5945,10 +7911,10 @@ static void draw_settings_overlay(void)
                        value_color, 1);
     }
 
-    gfx_text((int)x + 16, (int)(y + h) - 28,
-             "ARRIBA/ABAJO: ELEGIR   IZQ/DER: CAMBIAR", QV_DIM, 1);
-    gfx_text((int)x + 16, (int)(y + h) - 16,
-             "X: GUARDAR   CIRCLE: BORRAR TURBO   START: SALIR",
+    gfx_text((int)x + 12, (int)(y + h) - 20,
+             tr("ARRIBA/ABAJO: ELEGIR   IZQ/DER: CAMBIAR"), QV_DIM, 1);
+    gfx_text((int)x + 12, (int)(y + h) - 10,
+             tr("X: GUARDAR  START: CERRAR  MANTENER START: SALIR"),
              QV_DIM, 1);
 }
 
@@ -5964,7 +7930,7 @@ static void draw_edit_overlay(void)
     gfx_rect(x, y, w, h, QV_PANEL2);
     gfx_border(x, y, w, h, 2.0f, theme_is_game() ? theme_accent() : QV_RED);
 
-    gfx_text((int)x + 16, (int)y + 8, "EDITAR VISTA", QV_TEXT, 2);
+    gfx_text((int)x + 16, (int)y + 8, tr("EDITAR VISTA"), QV_TEXT, 2);
     gfx_rect(x + 16.0f, y + 30.0f, w - 32.0f, 1.0f, QV_TRACK);
 
     char line[48];
@@ -5979,7 +7945,7 @@ static void draw_edit_overlay(void)
         }
 
         snprintf(line, sizeof(line), "%d  %s", i + 1,
-                 g_widget_names[g_slot_item[i]]);
+                 widget_name(g_slot_item[i]));
         gfx_text((int)x + 20, (int)ry, line,
                  selected ? QV_TEXT : QV_DIM, 1);
 
@@ -6015,7 +7981,7 @@ static void draw_tel_edit_overlay(void)
     gfx_rect(x, y, w, h, QV_PANEL2);
     gfx_border(x, y, w, h, 2.0f, theme_is_game() ? theme_accent() : QV_RED);
 
-    gfx_text((int)x + 16, (int)y + 8, "SERIES DE TELEMETRIA", QV_TEXT, 2);
+    gfx_text((int)x + 16, (int)y + 8, tr("SERIES DE TELEMETRIA"), QV_TEXT, 2);
     gfx_rect(x + 16.0f, y + 30.0f, w - 32.0f, 1.0f, QV_TRACK);
 
     char line[40];
@@ -6080,6 +8046,27 @@ static void draw_net_banner(void)
     g_gfx_dim = saved_dim;
 }
 
+static uint32_t g_start_down_ms = 0;
+static int g_start_exit_latched = 0;
+
+static void exit_hold_tick(uint32_t now, unsigned int buttons)
+{
+    if (buttons & PSP_CTRL_START) {
+        if (g_start_down_ms == 0) {
+            g_start_down_ms = now ? now : 1;
+        } else if (!g_start_exit_latched &&
+                   (uint32_t)(now - g_start_down_ms) >= 1200u) {
+            g_start_exit_latched = 1;
+            g_exit_request = 1;
+            log_file_printf("Salida: START mantenido\n");
+            log_sync();
+        }
+    } else {
+        g_start_down_ms = 0;
+        g_start_exit_latched = 0;
+    }
+}
+
 static void run_sniff(int sock)
 {
     if (g_snif_running) {
@@ -6132,7 +8119,17 @@ static void run_sniff(int sock)
         SceCtrlData pad;
         memset(&pad, 0, sizeof(pad));
         sceCtrlReadBufferPositive(&pad, 1);
+
+        /* Mientras captura no se vuelve al bucle principal: sin esto la
+         * pantalla se quedaba congelada hasta dos minutos y parecia que
+         * la app habia colgado, aunque los botones siguieran funcionando. */
+        net_ui_tick();
         if (pad.Buttons & (PSP_CTRL_CIRCLE | PSP_CTRL_CROSS)) {
+            running = 0;
+            continue;
+        }
+        exit_hold_tick(now_ms(), pad.Buttons);
+        if (g_exit_request) {
             running = 0;
             continue;
         }
@@ -6229,6 +8226,889 @@ static void run_sniff(int sock)
     log_file_printf("=== FIN SNIFFER: %d tramas ===\n",
                     g_snif_total);
     log_sync();
+}
+
+/* ------------------------------------------------------------------ */
+/* SONDA DEL COCHE (pantalla PROBE).                                  */
+/*                                                                    */
+/* Para probar la app en un coche que no es el de referencia. No es un */
+/* dashboard: lee la identidad del adaptador y de la ECU, las mascaras */
+/* de PID y despues pide cada PID una vez para dejar escrito que       */
+/* contesta la centralita y que no. Solo lectura: modo 01 y modo 09,   */
+/* ningun servicio de escritura.                                      */
+/*                                                                    */
+/* Es una herramienta de diagnostico, no parte del producto: lo que    */
+/* vale de verdad es el log de la sesion, donde quedan todas las       */
+/* respuestas crudas. En pantalla cabe el resumen.                    */
+/* ------------------------------------------------------------------ */
+
+#define PROBE_ROWS    24
+#define PROBE_LABEL   18
+#define PROBE_VALUE   18
+#define PROBE_VISIBLE 12
+#define PROBE_AT_MS   2000
+#define PROBE_PID_MS  2000
+
+enum {
+    PROBE_IDLE = 0,
+    PROBE_RUNNING,
+    PROBE_DONE,
+    PROBE_NOLINK
+};
+
+typedef struct {
+    uint8_t pid;
+    int item;                     /* elemento del panel, para tel_print */
+    char label[PROBE_LABEL];
+    char value[PROBE_VALUE];
+    uint8_t answered;
+    uint8_t no_data;
+} probe_row;
+
+static probe_row g_probe[PROBE_ROWS];
+static int g_probe_count = 0;
+static int g_probe_ok = 0;
+static int g_probe_state = PROBE_IDLE;
+static int g_probe_scroll = 0;
+static int g_probe_request = 0;
+static char g_probe_hint[48] = "";
+static char g_probe_proto[24] = "";
+static char g_probe_ati[24] = "";
+static char g_probe_vbat[16] = "";
+static char g_probe_header[48] = "";
+static char g_probe_vin[24] = "";
+static char g_probe_cal[24] = "";
+static char g_probe_cvn[24] = "";
+static char g_probe_ecu[24] = "";
+static uint32_t g_probe_mask[3];
+
+/* Copia acotada, sin depender de snprintf para no pelearse con
+ * -Wformat-truncation. */
+static void probe_copy(char *dst, size_t size, const char *src)
+{
+    size_t n;
+
+    if (size == 0) {
+        return;
+    }
+    if (src == NULL) {
+        src = "";
+    }
+    n = strlen(src);
+    if (n >= size) {
+        n = size - 1;
+    }
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+/* "a b" en un buffer acotado. */
+static void probe_pair(char *dst, size_t size, const char *a, const char *b)
+{
+    size_t used;
+
+    if (size == 0) {
+        return;
+    }
+    dst[0] = '\0';
+    probe_copy(dst, size, a);
+    used = strlen(dst);
+    if (used + 2 < size) {
+        dst[used] = ' ';
+        dst[used + 1] = '\0';
+        used++;
+    }
+    if (b != NULL && b[0] != '\0' && used + 1 < size) {
+        probe_copy(dst + used, size - used, b);
+    }
+}
+
+/* Comando AT cuya respuesta no interesa. */
+static void probe_send(int sock, const char *cmd, int wait_ms)
+{
+    elm_reply reply;
+
+    elm_send_and_read(sock, cmd, wait_ms, &reply);
+}
+
+static void probe_status(const char *msg)
+{
+    probe_copy(g_probe_hint, sizeof(g_probe_hint), msg);
+    net_ui_set(g_probe_hint);
+    net_ui_tick();
+}
+
+static void probe_clear(void)
+{
+    memset(g_probe, 0, sizeof(g_probe));
+    g_probe_count = 0;
+    g_probe_ok = 0;
+    g_probe_mask[0] = 0;
+    g_probe_mask[1] = 0;
+    g_probe_mask[2] = 0;
+    g_probe_proto[0] = '\0';
+    g_probe_ati[0] = '\0';
+    g_probe_vbat[0] = '\0';
+    g_probe_header[0] = '\0';
+    g_probe_vin[0] = '\0';
+    g_probe_cal[0] = '\0';
+    g_probe_cvn[0] = '\0';
+    g_probe_ecu[0] = '\0';
+    g_probe_hint[0] = '\0';
+    g_probe_scroll = 0;
+}
+
+/* Un comando AT, su respuesta de texto y al log. */
+static void probe_at(int sock, const char *cmd, char *out, size_t out_size)
+{
+    elm_reply reply;
+
+    elm_send_and_read(sock, cmd, PROBE_AT_MS, &reply);
+    probe_copy(out, out_size, reply.text);
+    log_file_printf("PROBE %-8s -> '%s'\n", cmd, reply.text);
+}
+
+/* Busca "41 <pid> xxxx" dentro de las lineas capturadas y devuelve la
+ * mascara. En K-line con ATH1 delante van los tres bytes de cabecera,
+ * asi que se busca el marcador 0x41 en vez de asumir la posicion: la
+ * sonda tiene que funcionar en cualquier protocolo, aunque el parser de
+ * descubrimiento del nucleo solo entienda cabeceras CAN. */
+static uint32_t probe_mask_from_capture(int *found)
+{
+    *found = 0;
+    for (int i = 0; i < g_cap_count; i++) {
+        obd_disc_line line;
+        if (!obd_disc_parse_line(g_cap[i], &line)) {
+            continue;
+        }
+        for (int b = 0; b + 6 <= line.data_len; b++) {
+            if (line.data[b] != 0x41) {
+                continue;
+            }
+            uint8_t pid = line.data[b + 1];
+            if (pid != 0x00 && pid != 0x20 && pid != 0x40) {
+                continue;
+            }
+            *found = 1;
+            return obd_pid_mask(&line.data[b + 2],
+                                line.data_len - (b + 2));
+        }
+    }
+    return 0;
+}
+
+/* Lee el bloque de mascara indicado (0x00, 0x20 o 0x40). */
+static uint32_t probe_mask_block(int sock, uint8_t block)
+{
+    char cmd[8];
+    int found = 0;
+    uint32_t mask;
+
+    snprintf(cmd, sizeof(cmd), "01%02X", (unsigned)block);
+    scan_send(sock, cmd, PROBE_PID_MS);
+    mask = probe_mask_from_capture(&found);
+    log_file_printf("PROBE %s: mascara %08X%s\n", cmd, (unsigned)mask,
+                    found ? "" : " (sin respuesta)");
+    for (int i = 0; i < g_cap_count; i++) {
+        log_file_printf("  %s\n", g_cap[i]);
+    }
+    return found ? mask : 0;
+}
+
+/* Texto ASCII de una respuesta de modo 09 (VIN, CalID, CVN, nombre de
+ * la ECU). Las respuestas largas llegan en varias lineas y algunos
+ * clones las prefieren con "0:", "1:"; el 0x49 se busca en cualquier
+ * posicion para no depender del protocolo. */
+static void probe_mode09(int sock, const char *cmd, const char *tag,
+                         char *out, size_t out_size)
+{
+    size_t written = 0;
+
+    if (out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    scan_send(sock, cmd, PROBE_PID_MS);
+    log_file_printf("PROBE %s (%s):\n", tag, cmd);
+    for (int i = 0; i < g_cap_count; i++) {
+        log_file_printf("  %s\n", g_cap[i]);
+    }
+
+    for (int i = 0; i < g_cap_count && written + 1 < out_size; i++) {
+        obd_disc_line line;
+        if (!obd_disc_parse_line(g_cap[i], &line)) {
+            continue;
+        }
+        for (int b = 0; b + 3 < line.data_len; b++) {
+            if (line.data[b] != 0x49) {
+                continue;
+            }
+            /* 49 <pid> <n>: se salta la cabecera de respuesta y el
+             * numero de trama. */
+            for (int k = b + 3;
+                 k < line.data_len && written + 1 < out_size; k++) {
+                unsigned char c = line.data[k];
+                if (c >= 0x20 && c < 0x7F) {
+                    out[written++] = (char)c;
+                }
+            }
+            break;
+        }
+    }
+    out[written] = '\0';
+    log_file_printf("PROBE %s texto: '%s'\n", tag, out);
+}
+
+static int probe_row_for_pid(uint8_t pid)
+{
+    for (int i = 0; i < g_probe_count; i++) {
+        if (g_probe[i].pid == pid) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Pide un PID una vez y apunta que ha pasado: respondio, NO DATA o
+ * timeout. Es la parte que dice que PID tiene de verdad el coche. */
+static void probe_pid(int sock, int item, uint8_t pid, const char *name)
+{
+    char cmd[8];
+    char label[PROBE_LABEL];
+    elm_reply reply;
+    probe_row *row;
+
+    if (g_probe_count >= PROBE_ROWS) {
+        return;
+    }
+    if (probe_row_for_pid(pid) >= 0) {
+        return;   /* MARIPOSA y VELOCIDAD comparten 0x0D */
+    }
+
+    row = &g_probe[g_probe_count++];
+    memset(row, 0, sizeof(*row));
+    row->pid = pid;
+    row->item = item;
+
+    snprintf(cmd, sizeof(cmd), "01%02X", (unsigned)pid);
+    probe_pair(label, sizeof(label), cmd, name);
+    probe_copy(row->label, sizeof(row->label), label);
+
+    elm_send_and_read(sock, cmd, PROBE_PID_MS, &reply);
+
+    if (reply.data && elm_frame_matches(&reply.frame, 0x01, pid)) {
+        obd_pid_value value;
+        row->answered = 1;
+        g_probe_ok++;
+        if (obd_pid_decode(pid, reply.frame.data, reply.frame.data_len,
+                           &value) == 0) {
+            tel_print(item, value.value, row->value, sizeof(row->value));
+        } else {
+            probe_copy(row->value, sizeof(row->value), "OK");
+        }
+    } else if (reply.no_data) {
+        row->no_data = 1;
+        probe_copy(row->value, sizeof(row->value), "NO DATA");
+    } else if (reply.unable) {
+        probe_copy(row->value, sizeof(row->value), "SIN COCHE");
+    } else if (reply.stopped) {
+        probe_copy(row->value, sizeof(row->value), "STOPPED");
+    } else {
+        probe_copy(row->value, sizeof(row->value), "TIMEOUT");
+    }
+
+    log_file_printf("PROBE %s %-11s = %s\n", cmd, name, row->value);
+}
+
+static void probe_sweep(int sock)
+{
+    for (int item = 0; item < W_COUNT; item++) {
+        uint8_t pid = widget_pid(item);
+        if (pid == 0) {
+            continue;   /* BOOST es derivado de MAP y baro */
+        }
+        probe_pid(sock, item, pid, g_widget_names[item]);
+        if (scan_cancelled()) {
+            log_file_printf("PROBE: cancelada por el usuario\n");
+            return;
+        }
+        net_ui_tick();
+    }
+}
+
+/* Mascaras: deja en el log la lista de PID que el coche declara. */
+static void probe_log_supported(void)
+{
+    log_file_printf("PROBE mascaras: %08X %08X %08X\n",
+                    (unsigned)g_probe_mask[0], (unsigned)g_probe_mask[1],
+                    (unsigned)g_probe_mask[2]);
+    log_file_printf("PROBE declara:");
+    for (int pid = 1; pid <= 0x60; pid++) {
+        int block = (pid - 1) / 0x20;
+        int bit = (pid - 1) % 0x20;
+        if (block < 0 || block > 2 || bit < 0 || bit > 31) {
+            break;
+        }
+        if ((g_probe_mask[block] >> (31 - bit)) & 1u) {
+            log_file_printf(" %02X", pid);
+        }
+    }
+    log_file_printf("\n");
+}
+
+static void run_probe(int sock)
+{
+    probe_clear();
+
+    if (sock < 0) {
+        g_probe_state = PROBE_NOLINK;
+        log_file_printf("SONDA: sin adaptador, no se puede sondear\n");
+        return;
+    }
+
+    log_file_printf("=== SONDA DEL COCHE ===\n");
+    g_probe_state = PROBE_RUNNING;
+    g_net_busy = 1;
+    g_net_ui_last = 0;
+
+    probe_status("SONDA: ADAPTADOR");
+    probe_send(sock, "ATE0", 1000);
+    probe_send(sock, "ATL0", 1000);
+    probe_send(sock, "ATS0", 1000);
+    probe_send(sock, "ATH0", 1000);
+    probe_at(sock, "ATI", g_probe_ati, sizeof(g_probe_ati));
+    probe_at(sock, "ATDPN", g_probe_proto, sizeof(g_probe_proto));
+    probe_at(sock, "ATRV", g_probe_vbat, sizeof(g_probe_vbat));
+    {
+        char proto_desc[48];
+        probe_at(sock, "ATDP", proto_desc, sizeof(proto_desc));
+    }
+
+    if (scan_cancelled()) {
+        goto probe_done;
+    }
+
+    probe_status("SONDA: MASCARAS DE PID");
+    g_probe_mask[0] = probe_mask_block(sock, 0x00);
+    if (obd_mask_supports(g_probe_mask[0], 0x20)) {
+        g_probe_mask[1] = probe_mask_block(sock, 0x20);
+        /* Dentro de su bloque el PID 0x40 es el 0x20: pasarle 0x40 hacia
+         * que la sonda no pidiera nunca el bloque 3. */
+        if (obd_mask_supports(g_probe_mask[1], 0x20)) {
+            g_probe_mask[2] = probe_mask_block(sock, 0x40);
+        }
+    }
+    probe_log_supported();
+
+    if (scan_cancelled()) {
+        goto probe_done;
+    }
+
+    /* Cabecera cruda: es la evidencia que hace falta para arreglar el
+     * descubrimiento de modulos en K-line. */
+    probe_status("SONDA: CABECERA");
+    probe_send(sock, "ATH1", 1000);
+    probe_send(sock, "ATS1", 1000);
+    scan_send(sock, "0100", PROBE_PID_MS);
+    if (g_cap_count > 0) {
+        probe_copy(g_probe_header, sizeof(g_probe_header), g_cap[0]);
+    }
+    log_file_printf("PROBE cabecera 0100: '%s'\n", g_probe_header);
+    probe_send(sock, "ATH0", 1000);
+    probe_send(sock, "ATS0", 1000);
+
+    if (scan_cancelled()) {
+        goto probe_done;
+    }
+
+    probe_status("SONDA: VIN");
+    probe_mode09(sock, "0902", "VIN", g_probe_vin, sizeof(g_probe_vin));
+    probe_status("SONDA: CALID");
+    probe_mode09(sock, "0904", "CALID", g_probe_cal, sizeof(g_probe_cal));
+    probe_status("SONDA: CVN");
+    probe_mode09(sock, "0906", "CVN", g_probe_cvn, sizeof(g_probe_cvn));
+    probe_status("SONDA: ECU");
+    probe_mode09(sock, "090A", "ECU", g_probe_ecu, sizeof(g_probe_ecu));
+
+    if (scan_cancelled()) {
+        goto probe_done;
+    }
+
+    probe_status("SONDA: PID UNO A UNO");
+    probe_sweep(sock);
+
+probe_done:
+    /* El dashboard necesita el adaptador como lo dejo el handshake. */
+    probe_send(sock, "ATH0", 800);
+    probe_send(sock, "ATS0", 800);
+    probe_send(sock, "ATE0", 800);
+    probe_send(sock, "ATL0", 800);
+    scan_refresh_proto(sock, "sonda");
+    probe_copy(g_probe_proto, sizeof(g_probe_proto), g_proto);
+
+    log_file_printf("PROBE resumen: %d/%d PID responden, protocolo '%s'\n",
+                    g_probe_ok, g_probe_count, g_probe_proto);
+    log_sync();
+
+    g_probe_state = PROBE_DONE;
+    g_probe_hint[0] = '\0';
+    g_net_busy = 0;
+    g_net_ui_last = 0;
+}
+
+static void draw_probe(void)
+{
+    char txt[80];
+    int max_scroll = g_probe_count - PROBE_VISIBLE;
+
+    if (max_scroll < 0) {
+        max_scroll = 0;
+    }
+    if (g_probe_scroll > max_scroll) {
+        g_probe_scroll = max_scroll;
+    }
+    if (g_probe_scroll < 0) {
+        g_probe_scroll = 0;
+    }
+
+    gfx_text(8, 32, tr("SONDA DEL COCHE"), QV_TEXT, 1);
+
+    if (g_probe_state == PROBE_IDLE) {
+        gfx_text(8, 56, tr("PULSA X PARA SONDEAR EL COCHE."), QV_TEXT, 1);
+        gfx_text(8, 72, "Solo lectura: modo 01 y modo 09.", QV_DIM, 1);
+        gfx_text(8, 88, "El resultado completo queda en el log.", QV_DIM, 1);
+        return;
+    }
+    if (g_probe_state == PROBE_NOLINK) {
+        gfx_text(8, 56, "SIN ADAPTADOR.", QV_AMBER, 1);
+        gfx_text(8, 72, "TRIANGLE REINTENTA LA CONEXION.", QV_DIM, 1);
+        return;
+    }
+    if (g_probe_state == PROBE_RUNNING) {
+        gfx_text(8, 56, g_probe_hint, QV_AMBER, 1);
+        gfx_text(8, 72, "CIRCLE CANCELA.", QV_DIM, 1);
+        return;
+    }
+
+    /* Adaptador y protocolo. */
+    gfx_text(8, 44, "PROT", QV_DIM, 1);
+    gfx_text(40, 44, g_probe_proto[0] ? g_probe_proto : "-", QV_TEXT, 1);
+    gfx_text(96, 44, "BAT", QV_DIM, 1);
+    gfx_text(122, 44, g_probe_vbat[0] ? g_probe_vbat : "-", QV_TEXT, 1);
+    gfx_text(176, 44, "ADAPTADOR", QV_DIM, 1);
+    gfx_text(238, 44, g_probe_ati[0] ? g_probe_ati : "-", QV_TEXT, 1);
+
+    snprintf(txt, sizeof(txt), "MASC %08X %08X %08X",
+             (unsigned)g_probe_mask[0], (unsigned)g_probe_mask[1],
+             (unsigned)g_probe_mask[2]);
+    gfx_text(8, 56, txt, QV_DIM, 1);
+
+    snprintf(txt, sizeof(txt), "PID %d/%d", g_probe_ok, g_probe_count);
+    gfx_text(8, 68, txt, g_probe_ok > 0 ? QV_OK : QV_AMBER, 1);
+    if (g_probe_vin[0] != '\0') {
+        snprintf(txt, sizeof(txt), "VIN %s", g_probe_vin);
+        gfx_text(96, 68, txt, QV_TEXT, 1);
+    }
+
+    gfx_rect(8.0f, 80.0f, GFX_W - 16.0f, 1.0f, QV_TRACK);
+    gfx_text(10, 84, "PID  DATO", QV_DIM, 1);
+    gfx_text_right(400, 84, "RESPUESTA", QV_DIM, 1);
+
+    for (int i = 0; i < PROBE_VISIBLE; i++) {
+        int idx = g_probe_scroll + i;
+        uint32_t color;
+        if (idx >= g_probe_count) {
+            break;
+        }
+        if (g_probe[idx].answered) {
+            color = QV_OK;
+        } else if (g_probe[idx].no_data) {
+            color = QV_AMBER;
+        } else {
+            color = QV_DIM;
+        }
+        int y = 96 + i * 13;
+        gfx_text(10, y, g_probe[idx].label, QV_TEXT, 1);
+        gfx_text_right(400, y, g_probe[idx].value, color, 1);
+    }
+
+    if (g_probe_ecu[0] != '\0') {
+        snprintf(txt, sizeof(txt), "ECU %s", g_probe_ecu);
+        gfx_text(8, 258, txt, QV_DIM, 1);
+    }
+
+    if (max_scroll > 0) {
+        float tx = GFX_W - 8.0f;
+        float ty = 92.0f;
+        float th = 160.0f;
+        float bh;
+        gfx_rect(tx, ty, 2.0f, th, QV_TRACK);
+        bh = th * (float)PROBE_VISIBLE / (float)g_probe_count;
+        gfx_rect(tx, ty + (th - bh) * (float)g_probe_scroll /
+                     (float)max_scroll, 2.0f, bh, QV_DIM);
+    }
+}
+
+/* Selector de pantallas (SELECT). Las lista todas con su proposito y su
+ * estado en este coche: lo que no se puede usar sale en gris y con el
+ * motivo, porque ocultarlo no ensena nada. */
+static void draw_picker(void)
+{
+    int y = 44;
+
+    gfx_rect(0.0f, 0.0f, (float)GFX_W, (float)GFX_H, QV_BG);
+    gfx_rect(0.0f, 0.0f, (float)GFX_W, 26.0f, QV_PANEL);
+    gfx_text(8, 8, tr("PANTALLAS"), QV_TEXT, 1);
+    if (g_vehicle_name[0] != '\0') {
+        gfx_text(8 + gfx_text_width(tr("PANTALLAS"), 1) + 10, 8,
+                 g_vehicle_name, QV_CYAN, 1);
+    }
+    gfx_text_right(GFX_W - 8, 8, tr("X: ABRIR   SELECT: CERRAR"), QV_DIM, 1);
+    gfx_rect(8.0f, 30.0f, (float)GFX_W - 16.0f, 1.0f, QV_TRACK);
+
+    for (int i = 0; i < MODE_COUNT; i++) {
+        int mode = g_picker_order[i];
+        int avail = screen_offered(mode);
+        int sel = (i == g_picker_sel);
+
+        if (!avail && !screen_available(mode)) {
+            /* oculta: no ocupa sitio en la lista */
+            continue;
+        }
+        if (i == 4) {
+            gfx_text(14, y, tr("HERRAMIENTAS"), QV_DIM, 1);
+            y += 14;
+        }
+        if (sel) {
+            gfx_rect(4.0f, (float)y - 3.0f, (float)GFX_W - 8.0f, 20.0f,
+                     QV_PANEL2);
+            gfx_rect(4.0f, (float)y - 3.0f, 3.0f, 20.0f,
+                     theme_is_game() ? theme_accent() : QV_RED);
+        }
+        gfx_text(14, y, mode_name(mode), avail ? QV_TEXT : QV_DIM, 1);
+        gfx_text(120, y, mode_purpose(mode), QV_DIM, 1);
+        if (!avail) {
+            gfx_text_right(GFX_W - 12, y, screen_reason(mode), QV_AMBER, 1);
+        } else if (mode == g_mode) {
+            gfx_text_right(GFX_W - 12, y, tr("ACTUAL"), QV_OK, 1);
+        }
+        y += 24;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* FALLOS: codigos de averia (modos 03, 07 y 0A). Solo lectura.        */
+/* ------------------------------------------------------------------ */
+
+#define DTC_MAX 12
+
+static obd_dtc g_dtc_stored[DTC_MAX];
+static obd_dtc g_dtc_pending[DTC_MAX];
+static obd_dtc g_dtc_permanent[DTC_MAX];
+static int g_dtc_stored_n = 0;
+static int g_dtc_pending_n = 0;
+static int g_dtc_permanent_n = 0;
+
+/* Modo 02: la foto que guarda la centralita cuando salta el fallo. Solo
+ * se pide si hay codigos guardados; un coche sin codigos no tiene foto y
+ * no se gastan peticiones en preguntar. */
+static int g_ff_rpm = -1;
+static int g_ff_speed = -1;
+static int g_ff_ect = -1;
+static int g_ff_load = -1;
+static char g_dtc_note[32] = "";
+static int g_dtc_request = 0;
+
+static int dtc_hex_digit(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    return -1;
+}
+
+/* Pasa a bytes la respuesta en texto del ELM327 ("43 01 33 00 00 00 00").
+ * Devuelve cuantos bytes hay, servicio incluido; 0 si no habia datos. */
+static int dtc_read_hex(int sock, const char *cmd, uint8_t *out, int max,
+                        elm_reply *reply)
+{
+    elm_send_and_read(sock, cmd, 3000, reply);
+    if (!reply->data) {
+        return 0;
+    }
+
+    int n = 0;
+    const char *p = reply->text;
+    while (*p != '\0' && n < max) {
+        while (*p == ' ') {
+            p++;
+        }
+        if (dtc_hex_digit(p[0]) < 0 || dtc_hex_digit(p[1]) < 0) {
+            break;
+        }
+        out[n++] = (uint8_t)((dtc_hex_digit(p[0]) << 4) | dtc_hex_digit(p[1]));
+        p += 2;
+    }
+    return n;
+}
+
+static void run_fallos(int sock)
+{
+    if (g_dtc_state == 1) {
+        return;
+    }
+
+    g_dtc_state = 1;
+    g_net_busy = 1;   /* que se pinte el aviso mientras lee */
+    g_dtc_stored_n = 0;
+    g_dtc_pending_n = 0;
+    g_dtc_permanent_n = 0;
+    g_dtc_mil = -1;
+    g_dtc_count = -1;
+    snprintf(g_dtc_note, sizeof(g_dtc_note), "%s", tr("LEYENDO"));
+    /* El cartel de red es lo unico que se repinta dentro de las lecturas
+     * bloqueantes: es donde se ve que la app sigue viva. */
+    net_ui_set(g_dtc_note);
+
+    if (sock < 0) {
+        /* Sin adaptador no hay nada que leer, y el aviso de "conectando"
+         * tiene que apagarse igual: si no, la barra se queda en CONECT
+         * para siempre. */
+        g_net_busy = 0;
+        g_dtc_state = 2;
+        snprintf(g_dtc_note, sizeof(g_dtc_note), "%s", tr("SIN ADAPTADOR"));
+        return;
+    }
+
+    /* Con las cabeceras apagadas, que es como trabaja el dashboard: la
+     * respuesta empieza por el byte de servicio (41, 43, 47, 4A). */
+    elm_reply reply;
+    uint8_t buf[32];
+
+    log_file_printf("=== CODIGOS DE AVERIA ===\n");
+
+    int n = dtc_read_hex(sock, "0101", buf, (int)sizeof(buf), &reply);
+    if (n >= 3 && buf[0] == 0x41 && buf[1] == 0x01) {
+        obd_dtc_mil(&buf[2], n - 2, &g_dtc_mil, &g_dtc_count);
+        log_file_printf("MIL: %d, codigos: %d\n", g_dtc_mil, g_dtc_count);
+    } else {
+        log_file_printf("MIL: sin respuesta (0101)\n");
+    }
+
+    n = dtc_read_hex(sock, "03", buf, (int)sizeof(buf), &reply);
+    if (n >= 2 && buf[0] == 0x43) {
+        g_dtc_stored_n = obd_dtc_parse(&buf[1], n - 1, g_dtc_stored, DTC_MAX);
+        if (g_dtc_stored_n < 0) {
+            g_dtc_stored_n = 0;
+        }
+    }
+
+    /* Foto del fallo, solo si hay codigos guardados. */
+    g_ff_valid = 0;
+    g_ff_rpm = -1;
+    g_ff_speed = -1;
+    g_ff_ect = -1;
+    g_ff_load = -1;
+    g_ff_offered = 0;
+    if (g_dtc_stored_n > 0 && !obd_mask_supports(g_mask1, 0x02)) {
+        /* La MX-5 NB2 no anuncia el modo 02 (0100 = BE1FB811). Pedirlo
+         * gasta peticiones y deja la fila del congelado muda para
+         * siempre; mejor saberlo y decirlo en pantalla. */
+        log_file_printf("Congelado: la ECU no da el modo 02 (0100)\n");
+    } else if (g_dtc_stored_n > 0) {
+        g_ff_offered = 1;
+        /* La respuesta del modo 02 lleva el numero de fotograma delante de
+         * los datos: "42 PID FR D...". Con cabeceras apagadas y sin relleno
+         * llegan cinco bytes; con relleno CAN llegan ocho. Se mira la
+         * longitud para no comerse el fotograma como si fuera un dato. */
+        n = dtc_read_hex(sock, "0200", buf, (int)sizeof(buf), &reply);
+        const int ff_len = n;
+        if (n >= 7 && buf[0] == 0x42 && buf[1] == 0x00) {
+            uint32_t ff_mask = obd_disc_mask(&buf[3], n - 3);
+            g_ff_valid = 1;
+
+            /* Los cuatro valores que cuentan la historia del fallo, cada
+             * uno con su decodificacion de la norma (J1979). */
+            /* Primer byte de datos del fotograma: 3 si vino el numero de
+             * fotograma (lo normal), 2 si el clon se lo salto. */
+            int ff_off = (n >= 7) ? 3 : 2;
+
+            if (obd_mask_supports(ff_mask, 0x0C)) {
+                n = dtc_read_hex(sock, "020C00", buf, (int)sizeof(buf),
+                                 &reply);
+                ff_off = (n >= 6) ? 3 : 2;
+                if (n > ff_off + 1 && buf[0] == 0x42 && buf[1] == 0x0C) {
+                    g_ff_rpm = ((buf[ff_off] << 8) | buf[ff_off + 1]) / 4;
+                }
+            }
+            if (obd_mask_supports(ff_mask, 0x0D)) {
+                n = dtc_read_hex(sock, "020D00", buf, (int)sizeof(buf),
+                                 &reply);
+                ff_off = (n >= 5) ? 3 : 2;
+                if (n > ff_off && buf[0] == 0x42 && buf[1] == 0x0D) {
+                    g_ff_speed = buf[ff_off];
+                }
+            }
+            if (obd_mask_supports(ff_mask, 0x05)) {
+                n = dtc_read_hex(sock, "020500", buf, (int)sizeof(buf),
+                                 &reply);
+                ff_off = (n >= 5) ? 3 : 2;
+                if (n > ff_off && buf[0] == 0x42 && buf[1] == 0x05) {
+                    g_ff_ect = (int)buf[ff_off] - 40;
+                }
+            }
+            if (obd_mask_supports(ff_mask, 0x04)) {
+                n = dtc_read_hex(sock, "020400", buf, (int)sizeof(buf),
+                                 &reply);
+                ff_off = (n >= 5) ? 3 : 2;
+                if (n > ff_off && buf[0] == 0x42 && buf[1] == 0x04) {
+                    g_ff_load = (int)buf[ff_off] * 100 / 255;
+                }
+            }
+            /* Una linea con lo que contesto de verdad: la forma del modo 02
+             * cambia entre adaptadores y sin esto no hay como comprobarlo. */
+            log_file_printf("Congelado: 0200 -> %d bytes\n", ff_len);
+            log_file_printf("Congelado: rpm=%d spd=%d ect=%d load=%d\n",
+                            g_ff_rpm, g_ff_speed, g_ff_ect, g_ff_load);
+        }
+    }
+
+    n = dtc_read_hex(sock, "07", buf, (int)sizeof(buf), &reply);
+    if (n >= 2 && buf[0] == 0x47) {
+        g_dtc_pending_n = obd_dtc_parse(&buf[1], n - 1, g_dtc_pending, DTC_MAX);
+        if (g_dtc_pending_n < 0) {
+            g_dtc_pending_n = 0;
+        }
+    }
+
+    n = dtc_read_hex(sock, "0A", buf, (int)sizeof(buf), &reply);
+    if (n >= 2 && buf[0] == 0x4A) {
+        g_dtc_permanent_n = obd_dtc_parse(&buf[1], n - 1, g_dtc_permanent,
+                                          DTC_MAX);
+        if (g_dtc_permanent_n < 0) {
+            g_dtc_permanent_n = 0;
+        }
+    }
+
+    log_file_printf("Codigos: guardados=%d pendientes=%d permanentes=%d\n",
+                    g_dtc_stored_n, g_dtc_pending_n, g_dtc_permanent_n);
+    log_sync();
+
+    g_net_busy = 0;
+    net_ui_set("");
+    g_dtc_state = 2;
+    g_dtc_note[0] = '\0';
+}
+
+/* Una fila de codigo: el codigo y, si la tabla lo conoce, que significa. */
+static void dtc_draw_row(const obd_dtc *d, int x, int y)
+{
+    const char *desc = obd_dtc_describe(d->code);
+    gfx_text(x, y, d->code, QV_TEXT, 1);
+    if (desc != NULL) {
+        gfx_text(x + 56, y, desc, QV_DIM, 1);
+    } else {
+        gfx_text(x + 56, y, tr("sin descripcion"), QV_DIM, 1);
+    }
+}
+
+static void draw_fallos(void)
+{
+    int y = 40;
+
+    gfx_text(8, y, tr("FALLOS"), QV_TEXT, 2);
+    char line[48];
+    const char *mil = (g_dtc_mil < 0) ? "N/D"
+                                      : (g_dtc_mil ? tr("SI") : tr("NO"));
+    const char *cnt = (g_dtc_count < 0) ? "N/D" : "";
+    if (g_dtc_count >= 0) {
+        snprintf(line, sizeof(line), "%s %s   %s %s %d", tr("LAMPARA"), mil,
+                 tr("CODIGOS"), cnt, g_dtc_count);
+    } else {
+        snprintf(line, sizeof(line), "%s %s   %s %s", tr("LAMPARA"), mil,
+                 tr("CODIGOS"), cnt);
+    }
+    gfx_text_right(GFX_W - 8, y + 4, line, QV_DIM, 1);
+    y += 24;
+
+    if (g_dtc_state == 1) {
+        gfx_text(8, y, g_dtc_note, QV_AMBER, 1);
+        return;
+    }
+
+    const char *names[3] = { tr("GUARDADOS"), tr("PENDIENTES"),
+                             tr("PERMANENTES") };
+    const obd_dtc *sets[3] = { g_dtc_stored, g_dtc_pending,
+                               g_dtc_permanent };
+    const int counts[3] = { g_dtc_stored_n, g_dtc_pending_n,
+                            g_dtc_permanent_n };
+
+    if (g_dtc_state == 0) {
+        gfx_text(8, y, tr("X: LEER   CIRCLE: LIMPIAR PANTALLA"), QV_DIM, 1);
+        return;
+    }
+
+    for (int g = 0; g < 3; g++) {
+        if (y > 216) {
+            break;
+        }
+        snprintf(line, sizeof(line), "%s (%d)", names[g], counts[g]);
+        gfx_text(8, y, line, QV_CYAN, 1);
+        y += 14;
+        if (counts[g] == 0) {
+            gfx_text(20, y, tr("SIN CODIGOS"), QV_DIM, 1);
+            y += 14;
+            continue;
+        }
+        for (int i = 0; i < counts[g] && y <= 216; i++) {
+            dtc_draw_row(&sets[g][i], 20, y);
+            y += 14;
+        }
+        y += 4;
+    }
+
+    /* La foto del fallo, si la hay: es lo que estaba pasando cuando salto.
+     * La columna de los datos se calcula con el ancho real de la etiqueta:
+     * con 52 fijos, "CONGELADO" llegaba a x=86 y se comia el principio del
+     * valor, y en ingles "FREEZE FRAME" llegaba a 113. */
+    if (g_dtc_stored_n > 0) {
+        int fx = 8 + gfx_text_width(tr("CONGELADO"), 1) + 16;
+        gfx_text(8, 232, tr("CONGELADO"), QV_CYAN, 1);
+        if (!g_ff_valid) {
+            /* Dos razones distintas para una fila vacia: la ECU no da el
+             * modo 02, o lo da y no contesto. Antes las dos se callaban. */
+            gfx_text(fx, 232, g_ff_offered ? "SIN DATOS"
+                                           : tr("SIN MODO 02"), QV_DIM, 1);
+        }
+    }
+    if (g_ff_valid) {
+        int fx = 8 + gfx_text_width(tr("CONGELADO"), 1) + 16;
+        gfx_text(8, 232, tr("CONGELADO"), QV_CYAN, 1);
+        char a[12] = "N/D", b[12] = "N/D", c[12] = "N/D", e[12] = "N/D";
+        if (g_ff_rpm >= 0) {
+            snprintf(a, sizeof(a), "%d", g_ff_rpm);
+        }
+        if (g_ff_speed >= 0) {
+            snprintf(b, sizeof(b), "%d", g_ff_speed);
+        }
+        if (g_ff_ect >= 0) {
+            snprintf(c, sizeof(c), "%d", g_ff_ect);
+        }
+        if (g_ff_load >= 0) {
+            snprintf(e, sizeof(e), "%d", g_ff_load);
+        }
+        snprintf(line, sizeof(line), "%s rpm  %s km/h  %s C  %s%%",
+                 a, b, c, e);
+        gfx_text(fx, 232, line, QV_DIM, 1);
+    }
+
+    gfx_text(8, 254, tr("X: LEER   CIRCLE: LIMPIAR PANTALLA"), QV_DIM, 1);
 }
 
 static void draw_modules(void)
@@ -6577,8 +9457,11 @@ static void draw_theme_fx(const dash_data *d, uint32_t now)
             gfx_rect(402.0f, 54.0f, gw, 3.0f, QV_CYAN);
         }
 
-        if (d->rpm_valid && d->rpm_val >= redline_rpm() - 150.0f &&
-            ((now / 140u) & 1u)) {
+        /* Con perfil, el aviso salta al acercarse al corte real; sin el,
+         * 150 rpm antes de la zona roja como siempre. */
+        float warn_rpm = g_profile_cut > 0 ? (float)g_profile_cut - 300.0f
+                                          : redline_rpm() - 150.0f;
+        if (d->rpm_valid && d->rpm_raw >= warn_rpm && ((now / 140u) & 1u)) {
             gfx_border(0, 0, (float)GFX_W, (float)GFX_H, 2.0f, QV_RED);
         }
     }
@@ -6625,6 +9508,9 @@ static const info_entry g_info[] = {
       "Temperatura del aceite del motor (0x5C)." },
     { W_FUEL, "COMBUSTIBLE",
       "Nivel de combustible en % (0x2F)." },
+    { W_GEAR, "MARCHA",
+      "Marcha deducida de RPM y velocidad con las relaciones del coche. "
+      "Si no cuadra con ninguna, N/D." },
     { W_STFT, "STFT",
       "Correccion corta de mezcla, banco 1 (0x06)." },
     { W_LTFT, "LTFT",
@@ -6737,7 +9623,7 @@ static int dash_widget_count(void)
 {
     int n = 0;
     for (int i = 0; i < DASH_SLOTS; i++) {
-        if (g_slot_item[i] != W_OFF && g_slot_style[i] != STYLE_OFF) {
+        if (slot_item_eff(i) != W_OFF && slot_style_eff(i) != STYLE_OFF) {
             n++;
         }
     }
@@ -6877,9 +9763,16 @@ static void draw_screen(uint32_t now, int requests, int data_count,
     float value;
 
     if (sample_value(0x0C, now, &value)) {
-        fmt_0(d.rpm, sizeof(d.rpm), value);
         d.rpm_valid = 1;
-        d.rpm_val = value;
+        d.rpm_raw = value;
+        /* El numero es siempre la medida; la aguja, con el ease de AGUJA. */
+        fmt_0(d.rpm, sizeof(d.rpm), value);
+        float needle = value;
+        if (sample_value_needle(0x0C, now, &needle)) {
+            d.rpm_val = needle;
+        } else {
+            d.rpm_val = value;
+        }
     }
     if (sample_value(0x0B, now, &value)) {
         if (units_imperial()) {
@@ -6909,7 +9802,14 @@ static void draw_screen(uint32_t now, int requests, int data_count,
     if (sample_value(0x0D, now, &value)) {
         fmt_0(d.speed, sizeof(d.speed), units_speed_from_kmh(value));
         d.speed_valid = 1;
-        d.speed_val = units_speed_from_kmh(value);
+        d.speed_raw = value;
+        /* La aguja del velocimetro se suaviza igual que la del tacometro. */
+        float needle = value;
+        if (sample_value_needle(0x0D, now, &needle)) {
+            d.speed_val = units_speed_from_kmh(needle);
+        } else {
+            d.speed_val = units_speed_from_kmh(value);
+        }
     }
     if (sample_value(g_thr_pid, now, &value)) {
         fmt_0(d.thr, sizeof(d.thr), value);
@@ -6975,6 +9875,15 @@ static void draw_screen(uint32_t now, int requests, int data_count,
         d.dist_mil_val = value;
     }
 
+    /* Presion de aceite: calculada con la curva, con ~1 s de retardo. */
+    if (d.rpm_valid) {
+        float target = obd_oil_bar(d.rpm_raw, d.ect_val, d.ect_valid);
+        d.oilp_bar = obd_ease_apply(&g_oil_ease, target, now, 1000.0f);
+        d.oilp_valid = 1;
+    } else {
+        obd_smooth_reset(&g_oil_ease);
+    }
+
     if (g_boost.boost_valid) {
         char tmp[16];
         fmt_signed_2(tmp, sizeof(tmp),
@@ -7001,9 +9910,13 @@ static void draw_screen(uint32_t now, int requests, int data_count,
     int stale = data_is_stale(now);
     uint32_t age_ms = data_age_ms(now);
 
-    /* FASE F2 + 2.12: si el dato envejece, o estamos reconectando, el
-     * contenido se apaga (el marco se queda) pero sigue siendo legible. */
-    g_gfx_dim = (g_net_busy || age_ms >= DATA_OLD_MS) ? 55 : 100;
+    /* FASE F2: si el dato envejece, el contenido se apaga (el marco se
+     * queda). El panel deja de parecer congelado y empieza a explicar
+     * que lo que hay dentro ya no es de ahora. */
+    /* FASE 2.12 del autor original: mientras se reintenta la conexion el
+     * contenido tambien se atenua, para que se vea que lo de dentro no es
+     * de ahora aunque el marco siga vivo. */
+    g_gfx_dim = (g_net_busy || age_ms >= data_old_ms()) ? 55 : 100;
 
     theme_effects_update(now);
 
@@ -7031,14 +9944,16 @@ static void draw_screen(uint32_t now, int requests, int data_count,
     }
 
     if (g_cfg.peak_hold) {
-        if (d.rpm_valid && d.rpm_val > g_peak_rpm) {
-            g_peak_rpm = d.rpm_val;
+        /* Con la medida: la aguja puede ir adelantada hasta 1200 rpm y el
+         * pico no puede quedarse con un numero que el motor no dio. */
+        if (d.rpm_valid && d.rpm_raw > g_peak_rpm) {
+            g_peak_rpm = d.rpm_raw;
         }
         if (d.boost_valid && d.boost_val > g_peak_boost) {
             g_peak_boost = d.boost_val;
         }
         float sp;
-        if (sample_value(0x0D, now, &sp) && sp > g_peak_speed) {
+        if (sample_value_raw(0x0D, now, &sp) && sp > g_peak_speed) {
             g_peak_speed = sp;
         }
     }
@@ -7062,6 +9977,10 @@ static void draw_screen(uint32_t now, int requests, int data_count,
         draw_modules();
     } else if (g_mode == MODE_SNIFFER) {
         draw_sniffer();
+    } else if (g_mode == MODE_PROBE) {
+        draw_probe();
+    } else if (g_mode == MODE_FALLOS) {
+        draw_fallos();
     } else {
         draw_info();
     }
@@ -7070,6 +9989,10 @@ static void draw_screen(uint32_t now, int requests, int data_count,
         draw_theme_fx(&d, now);
     }
     draw_net_banner();
+
+    if (g_picker_open) {
+        draw_picker();
+    }
 
     if (g_settings_open && !g_edit_open) {
         draw_settings_overlay();
@@ -7110,6 +10033,11 @@ static void net_ui_set(const char *msg)
  * esperas de red para que el usuario vea progreso sin pantallas negras. */
 static void net_ui_tick(void)
 {
+    SceCtrlData pad;
+    memset(&pad, 0, sizeof(pad));
+    sceCtrlReadBufferPositive(&pad, 1);
+    exit_hold_tick(now_ms(), pad.Buttons);
+
     if (!g_gfx_active || !g_net_busy) {
         return;
     }
@@ -7143,11 +10071,11 @@ static int handle_mode_input(unsigned int pressed)
     int changed = 0;
 
     if (pressed & (PSP_CTRL_RTRIGGER | PSP_CTRL_RIGHT)) {
-        g_mode = (g_mode + 1) % MODE_COUNT;
+        g_mode = mode_step(g_mode, 1);
         changed = 1;
     }
     if (pressed & (PSP_CTRL_LTRIGGER | PSP_CTRL_LEFT)) {
-        g_mode = (g_mode + MODE_COUNT - 1) % MODE_COUNT;
+        g_mode = mode_step(g_mode, -1);
         changed = 1;
     }
 
@@ -7165,8 +10093,27 @@ static int handle_mode_input(unsigned int pressed)
         }
     }
 
+    if (g_mode == MODE_FALLOS && !g_settings_open) {
+        if ((pressed & PSP_CTRL_CROSS) && g_dtc_state != 1) {
+            g_dtc_request = 1;
+            changed = 1;
+        }
+        /* Limpia la PANTALLA, no la centralita: el modo 04 no se envia
+         * nunca. Es solo volver a "sin leer" para forzar una lectura. */
+        if (pressed & PSP_CTRL_CIRCLE) {
+            g_dtc_state = 0;
+            g_dtc_stored_n = 0;
+            g_dtc_pending_n = 0;
+            g_dtc_permanent_n = 0;
+            g_dtc_mil = -1;
+            g_dtc_count = -1;
+            g_ff_valid = 0;
+            changed = 1;
+        }
+    }
+
     if (g_mode == MODE_MODULES && !g_settings_open) {
-        if (pressed & PSP_CTRL_CROSS) {
+        if ((pressed & PSP_CTRL_CROSS) && screen_available(MODE_MODULES)) {
             g_scan_request = 1;
             changed = 1;
         }
@@ -7207,6 +10154,25 @@ static int handle_mode_input(unsigned int pressed)
         }
     }
 
+    if (g_mode == MODE_PROBE && !g_settings_open) {
+        if (pressed & PSP_CTRL_CROSS) {
+            g_probe_request = 1;
+            changed = 1;
+        }
+        if (pressed & PSP_CTRL_UP) {
+            if (g_probe_scroll > 0) {
+                g_probe_scroll--;
+            }
+            changed = 1;
+        }
+        if (pressed & PSP_CTRL_DOWN) {
+            if (g_probe_scroll + 1 < g_probe_count) {
+                g_probe_scroll++;
+            }
+            changed = 1;
+        }
+    }
+
     if (g_mode == MODE_INFO && !g_settings_open) {
         int count = (int)(sizeof(g_info) / sizeof(g_info[0]));
         int max_scroll = count - INFO_VISIBLE;
@@ -7233,6 +10199,15 @@ static int handle_mode_input(unsigned int pressed)
 static int handle_settings_input(unsigned int pressed)
 {
     int changed = 0;
+
+    /* START cierra el menu: es lo que dice el pie de la pantalla y lo que
+     * hacia antes de que SELECT se quedase el selector de pantallas. Sin
+     * esto el mando parece muerto con el menu abierto. */
+    if (pressed & (PSP_CTRL_START | PSP_CTRL_SELECT)) {
+        g_settings_open = 0;
+        settings_save();
+        return 1;
+    }
 
     if (pressed & PSP_CTRL_CROSS) {
         if (g_settings_sel == 6) {
@@ -7297,7 +10272,7 @@ static int handle_settings_input(unsigned int pressed)
                 g_cfg.contrast = 2;
             }
         } else if (g_settings_sel == 3) {
-            g_cfg.anim = !g_cfg.anim;
+            g_cfg.anim = (g_cfg.anim + 1) % 3;
         } else if (g_settings_sel == 4) {
             g_cfg.fast = !g_cfg.fast;
         } else if (g_settings_sel == 5) {
@@ -7325,7 +10300,25 @@ static int handle_settings_input(unsigned int pressed)
                 g_cfg.shift_rpm = g_cfg.rpm_max;
             }
         } else if (g_settings_sel == 9) {
-            g_cfg.rpm_max += dir * 500;
+            /* Ajustar el tacometro a mano devuelve el mando al usuario
+             * hasta la proxima conexion, cuando se vuelve a detectar. */
+            g_cfg.rpm_max = (int)tach_max_rpm() + dir * 500;
+            vehicle_release_tacho();
+            /* Se recuerda por coche: el MiTo y la MX-5 no comparten escala. */
+            if (g_vehicle_id[0] != '\0') {
+                vehicle_prefs *vp = car_prefs_for(g_vehicle_id, 1);
+                if (vp != NULL) {
+                    int v = g_cfg.rpm_max;
+                    if (v < 4000) {
+                        v = 4000;
+                    }
+                    if (v > 9000) {
+                        v = 9000;
+                    }
+                    vp->rpm_max = v;
+                    vp->has_tacho = 1;
+                }
+            }
             if (g_cfg.rpm_max < 4000) g_cfg.rpm_max = 4000;
             if (g_cfg.rpm_max > 9000) g_cfg.rpm_max = 9000;
             if (g_cfg.shift_rpm > g_cfg.rpm_max) {
@@ -7351,7 +10344,49 @@ static int handle_settings_input(unsigned int pressed)
         } else if (g_settings_sel == 14) {
             g_cfg.show_fps = !g_cfg.show_fps;
         } else if (g_settings_sel == 15) {
+            /* -1 = la ultima, y luego las pantallas en el orden del
+             * selector. */
+            g_start_mode++;
+            if (g_start_mode >= MODE_COUNT) {
+                g_start_mode = -1;
+            }
+        } else if (g_settings_sel == 16) {
             g_cfg.debug = !g_cfg.debug;
+        } else if (g_settings_sel == 17) {
+            int was = g_cfg.log;
+            g_cfg.log = (g_cfg.log + dir + 3) % 3;
+            /* Se aplica en el acto: apagarlo y seguir escribiendo hasta el
+             * siguiente encendido era justo lo contrario de lo pedido. */
+            if (g_cfg.log != was) {
+                log_close();
+                if (g_cfg.log > 0) {
+                    log_open();
+                    log_banner();
+                    settings_log_summary();
+                    log_file_printf("AJUSTE: log = %d\n", g_cfg.log);
+                    log_sync();
+                }
+            }
+        } else if (g_settings_sel == SET_NEEDLE) {
+            /* 0 = la medida tal cual, 1 = suave (150 ms), 2 = muy suave
+             * (400 ms). Cambiar esto solo afecta a lo que se pinta. */
+            g_cfg.needle += dir;
+            if (g_cfg.needle < 0) g_cfg.needle = 0;
+            if (g_cfg.needle > 2) g_cfg.needle = 2;
+            disp_reset();
+            log_file_printf("AJUSTE: aguja = %d (tau %d ms)\n",
+                            g_cfg.needle, (int)needle_tau_ms());
+            log_sync();
+        } else if (g_settings_sel == SET_SPLIT) {
+            /* Cuantos valores rapidos entran en el reparto del enlace. Con
+             * 0 el RPM se queda todo el presupuesto; el resto de cuadros
+             * siguen vivos pero mas lentos. */
+            g_cfg.split_values += dir;
+            if (g_cfg.split_values < 0) g_cfg.split_values = 0;
+            if (g_cfg.split_values > 4) g_cfg.split_values = 4;
+            log_file_printf("AJUSTE: reparto = %d valores\n",
+                            g_cfg.split_values);
+            log_sync();
         }
 
         settings_apply();
@@ -7392,10 +10427,14 @@ static int handle_edit_input(unsigned int pressed)
     }
     if (pressed & PSP_CTRL_TRIANGLE) {
         g_slot_item[g_edit_sel] = widget_cycle(g_slot_item[g_edit_sel], 1, 0);
+        g_layout_user = 1;
+        g_layout_dirty = 1;
         changed = 1;
     }
     if (pressed & PSP_CTRL_SQUARE) {
         g_slot_item[g_edit_sel] = widget_cycle(g_slot_item[g_edit_sel], -1, 0);
+        g_layout_user = 1;
+        g_layout_dirty = 1;
         changed = 1;
     }
 
@@ -7430,11 +10469,15 @@ static int handle_tel_edit_input(unsigned int pressed)
     if (pressed & PSP_CTRL_RIGHT) {
         g_tel_item[g_tel_edit_sel] =
             tel_cycle_step(g_tel_item[g_tel_edit_sel], 1);
+        g_layout_user = 1;
+        g_layout_dirty = 1;
         changed = 1;
     }
     if (pressed & PSP_CTRL_LEFT) {
         g_tel_item[g_tel_edit_sel] =
             tel_cycle_step(g_tel_item[g_tel_edit_sel], -1);
+        g_layout_user = 1;
+        g_layout_dirty = 1;
         changed = 1;
     }
 
@@ -7459,7 +10502,46 @@ static int handle_ui_input(unsigned int pressed)
         return handle_tel_edit_input(pressed);
     }
 
-    if (pressed & (PSP_CTRL_SELECT | PSP_CTRL_START)) {
+    /* Con el menu de ajustes abierto el mando es del menu. */
+    if (g_settings_open) {
+        return handle_settings_input(pressed);
+    }
+
+    /* Selector de pantallas: SELECT. El menu de ajustes se queda en
+     * START, que es lo que SELECT tambien hacia hasta ahora. */
+    if (g_picker_open) {
+        if (pressed & (PSP_CTRL_SELECT | PSP_CTRL_CIRCLE)) {
+            g_picker_open = 0;
+            return 1;
+        }
+        if (pressed & PSP_CTRL_UP) {
+            g_picker_sel = picker_step(g_picker_sel, -1);
+            return 1;
+        }
+        if (pressed & PSP_CTRL_DOWN) {
+            g_picker_sel = picker_step(g_picker_sel, 1);
+            return 1;
+        }
+        if (pressed & (PSP_CTRL_CROSS | PSP_CTRL_START)) {
+            int m = g_picker_order[g_picker_sel];
+            if (screen_offered(m)) {
+                g_mode = m;
+                g_picker_open = 0;
+                apply_screen_schedule(now_ms());
+                log_file_printf("Pantalla: %s\n", mode_name(m));
+            }
+            return 1;
+        }
+        return 1;
+    }
+
+    if (pressed & PSP_CTRL_SELECT) {
+        g_picker_open = 1;
+        g_picker_sel = picker_index_of(g_mode);
+        return 1;
+    }
+
+    if (pressed & PSP_CTRL_START) {
         if (!g_settings_open) {
             g_settings_open = 1;
             g_settings_sel = 0;
@@ -7470,9 +10552,6 @@ static int handle_ui_input(unsigned int pressed)
         return 1;
     }
 
-    if (g_settings_open) {
-        return handle_settings_input(pressed);
-    }
 
     return handle_mode_input(pressed);
 }
@@ -7524,18 +10603,20 @@ static void draw_splash_frame(unsigned int t)
 
 static void startup_animation(void)
 {
-    /* Con la animacion desactivada se muestra un unico fotograma final. */
-    if (!g_cfg.anim) {
-        draw_splash_frame(1600u);
+    /* Sin animacion se va directo al dashboard: ni fotograma ni espera. */
+    if (g_cfg.anim == 0) {
         return;
     }
 
     unsigned int start = now_ms();
+    /* Cada animacion dice cuanto dura; hoy las dos son 1600 ms, pero el
+     * bucle no lo da por supuesto. */
+    const uint32_t total = (g_cfg.anim == 2) ? splash_mx5_total_ms() : 1600u;
     SceCtrlData pad;
 
     for (;;) {
         unsigned int t = now_ms() - start;
-        if (t >= 1600u) {
+        if (t >= total) {
             break;
         }
 
@@ -7545,7 +10626,11 @@ static void startup_animation(void)
             break;
         }
 
-        draw_splash_frame(t);
+        if (g_cfg.anim == 2) {
+            splash_mx5_draw(t);
+        } else {
+            draw_splash_frame(t);
+        }
     }
 }
 
@@ -7560,9 +10645,11 @@ static void run_dashboard(Target *targets, int target_count)
     SceCtrlData pad;
     uint32_t start = now_ms();
 
-    g_hist_count = 0;
-    g_hist_pos = 0;
-    g_hist_last = 0;
+    hist_reset();
+    /* Las marcas de validez tambien: sin esto, series_stats recorria las
+     * 180 casillas y las casillas de MAX/MIN ensenaban los extremos de la
+     * sesion anterior hasta que el anillo daba la vuelta. */
+    memset(g_hist_valid, 0, sizeof(g_hist_valid));
     g_session_start_ms = start;
     g_exit_request = 0;
 
@@ -7592,7 +10679,9 @@ static void run_dashboard(Target *targets, int target_count)
     }
 
     log_file_printf("Dashboard %s\n",
-                    sock >= 0 ? "con adaptador" : "sin adaptador (N/D)");
+                    sock >= 0 ? "con adaptador"
+                              : (g_demo ? "sin adaptador, demo MX-5 (SIM)"
+                                        : "sin adaptador (N/D)"));
     log_sync();
 
     /* L+R mantenidos 1,5 s: activa/desactiva el modo demo. */
@@ -7650,10 +10739,20 @@ static void run_dashboard(Target *targets, int target_count)
             chord_done = 0;
         }
 
-        /* Reintento de conexion; deshabilitado con los ajustes abiertos. */
+        /* START mantenido 1,2 s sale de la app. La salida limpia guarda los
+         * ajustes y escribe el resumen de sesion al final del log; con HOME
+         * no se ejecuta nada de eso y el log se queda sin cierre, que es
+         * exactamente lo que paso el 18/11/2026. Una pulsacion corta sigue
+         * abriendo y cerrando el menu. */
+        exit_hold_tick(now, pad.Buttons);
+
+        /* Reintento de conexion; deshabilitado con los ajustes abiertos.
+         * El selector de pantallas se cierra antes: si no, taparia el
+         * aviso de CONECTANDO y SELECT pasaria a cancelar la conexion. */
         if (!g_settings_open &&
             (pressed & (PSP_CTRL_TRIANGLE | PSP_CTRL_SQUARE))) {
             int with_dialog = (pressed & PSP_CTRL_SQUARE) ? 1 : 0;
+            g_picker_open = 0;
 
             if (g_demo) {
                 demo_toggle();
@@ -7677,10 +10776,7 @@ static void run_dashboard(Target *targets, int target_count)
                 consecutive_timeouts = 0;
                 consecutive_errors = 0;
                 g_elm_stuck = 0;
-                g_try_atz = 0;
-                g_hist_count = 0;
-                g_hist_pos = 0;
-                g_hist_last = 0;
+                hist_reset();
             }
 
             last_status = now;
@@ -7695,11 +10791,26 @@ static void run_dashboard(Target *targets, int target_count)
 
         if (g_exit_request) {
             g_exit_request = 0;
-            log_file_printf("Salida solicitada desde el menu\n");
-            if (g_cfg.boost_auto) {
-                settings_save();
-            }
+            log_file_printf("Salida solicitada: cierre limpio\n");
+            /* Guardar al salir sella la pantalla donde se dejo. */
+            settings_save();
             break;
+        }
+
+        if (g_dtc_request) {
+            g_dtc_request = 0;
+            if (rx.active) {
+                obd_sched_end(&g_sched, rx_idx, now_ms(), 0);
+                if (sock >= 0) {
+                    elm_flush_input(sock);
+                }
+                memset(&rx, 0, sizeof(rx));
+            }
+            g_dtc_state = 0;
+            run_fallos(sock);
+            now = now_ms();
+            last_status = now;
+            continue;
         }
 
         if (g_scan_request) {
@@ -7734,18 +10845,35 @@ static void run_dashboard(Target *targets, int target_count)
             continue;
         }
 
+        if (g_probe_request) {
+            g_probe_request = 0;
+            /* La sonda usa el socket de forma bloqueante: no debe
+             * solaparse con una peticion en vuelo. */
+            if (rx.active) {
+                obd_sched_end(&g_sched, rx_idx, now_ms(), 0);
+                if (sock >= 0) {
+                    elm_flush_input(sock);
+                }
+                memset(&rx, 0, sizeof(rx));
+            }
+            run_probe(sock);
+            now = now_ms();
+            last_status = now;
+            continue;
+        }
+
         if (g_demo) {
             demo_update(now);
         }
         boost_learn_update(now);
 
         /* FASE D1 + F1: lectura OBD no bloqueante con hueco minimo. */
-        /* FASE 2.12: mientras hay una reconexion programada NO se
-         * sondea. El socket se ha reservado para el intento de ATZ y
-         * mandarle PIDs solo genera mas STOPPED que reinician el plazo
-         * del backoff (livelock: la reconexion nunca llegaba a correr). */
         int rx_ready = 0;
         int gap_pending = 0;
+        /* FASE 2.12: con una reconexion programada no se sondea. Si el
+         * socket sigue abierto (adaptador atascado) mandar PIDs solo genera
+         * mas STOPPED, que reinician el plazo del backoff: la reconexion no
+         * llegaba a ejecutarse nunca. */
         if (sock >= 0 && !g_demo && !reconn_active) {
             if (!rx.active) {
                 /* FASE F1: si el ELM327 aun no ha tenido su silencio,
@@ -7774,10 +10902,10 @@ static void run_dashboard(Target *targets, int target_count)
             uint32_t t1 = now_ms();
 
             /* FASE F1: se ancla el hueco en el instante en que la
-             * respuesta se completo, salvo que la respuesta fuese un
-             * STOPPED: en ese caso el ELM327 esta atascado y marcar el
-             * ancla aqui haria esperar 8 ms desde un comando que el
-             * adaptador ni llego a procesar. */
+             * respuesta se completo, salvo que sea un STOPPED: ahi el
+             * ELM327 no proceso el comando, y contar el hueco desde esa
+             * respuesta hace esperar de mas al siguiente.
+             * Portado del autor original (fase2.45). */
             if (!reply->stopped) {
                 g_last_resp_ms = t1;
             }
@@ -7788,6 +10916,7 @@ static void run_dashboard(Target *targets, int target_count)
             int got_data = 0;
             if (reply->data && elm_frame_matches(&reply->frame, 0x01, pid)) {
                 store_value(pid, &reply->frame, t1);
+                data_note_sample(t1);
                 got_data = 1;
                 data_count++;
             } else if (reply->no_data) {
@@ -7804,11 +10933,11 @@ static void run_dashboard(Target *targets, int target_count)
                 consecutive_errors = 0;
             }
 
-            /* FASE F (correccion 21-nov): contador de STOPPED en
-             * ventana deslizante. Un fallo aislado no debe descartar
-             * los anteriores: en los viajes reales aparecen STOPPED
-             * intercalados con respuestas buenas y el contador
-             * consecutivo nunca llegaba a 8. */
+            /* FASE F2: STOPPED contados en ventana deslizante de 12
+             * peticiones. El ELM327 se queda pegado en STOPPED y no sale
+             * ni con reintentos; con un contador de seguidos, los STOPPED
+             * intercalados con respuestas buenas no llegaban nunca a 8 y
+             * la reconexion no se disparaba. Portado de fase2.45. */
             if (++g_elm_window >= 12) {
                 g_elm_window = 0;
                 if (g_elm_stuck > 0) {
@@ -7819,6 +10948,12 @@ static void run_dashboard(Target *targets, int target_count)
                 g_elm_stuck++;
             } else if (g_elm_stuck > 0) {
                 g_elm_stuck--;
+            }
+
+            if (reply->no_data || reply->unable) {
+                g_no_data_streak++;
+            } else if (got_data) {
+                g_no_data_streak = 0;
             }
 
             obd_sched_end(&g_sched, rx_idx, t1,
@@ -7849,11 +10984,17 @@ static void run_dashboard(Target *targets, int target_count)
             if (g_elm_stuck >= ELM_STUCK_RECOVER) {
                 link_bad = 1;
             }
+            if (g_no_data_streak >= ELM_NO_DATA_RECOVER) {
+                link_bad = 1;
+            }
 
             if (link_bad) {
                     if (g_elm_stuck >= ELM_STUCK_RECOVER) {
                         log_file_printf("Enlace perdido: adaptador atascado "
                                         "en STOPPED (%d)\n", g_elm_stuck);
+                    } else if (g_no_data_streak >= ELM_NO_DATA_RECOVER) {
+                        log_file_printf("Enlace perdido: %d NO DATA "
+                                        "seguidos\n", g_no_data_streak);
                     } else {
                         log_file_printf("Enlace perdido: %s\n",
                                         reply->bytes == 0
@@ -7862,23 +11003,32 @@ static void run_dashboard(Target *targets, int target_count)
                     }
                     log_sync();
 
-                    /* FASE 2.12: si el motivo es un atasco en STOPPED se
-                     * conserva el socket para probar ATZ al vencer el
-                     * backoff. En los demas cortes se cierra como antes.
+                    /* FASE 2.12: si el motivo es un atasco en STOPPED, el
+                     * socket se conserva para probar ATZ al vencer el
+                     * backoff; en los demas cortes se cierra como antes.
                      * En ningun caso se toca g_store: los ultimos valores
-                     * medidos deben seguir en pantalla, atenuados. */
+                     * medidos siguen en pantalla, atenuados. */
                     g_try_atz = (g_elm_stuck >= ELM_STUCK_RECOVER);
                     if (!g_try_atz) {
                         sceNetInetClose(sock);
                         sock = -1;
                     }
+                    /* Instantanea de los ultimos valores medidos antes de
+                     * que connect_network_and_elm() limpie el almacen. */
+                    g_keep_store = g_store;
+                    g_keep_boost = g_boost;
                     g_link_connected = 0;
                     memset(&rx, 0, sizeof(rx));
                     link_losses++;
                     consecutive_timeouts = 0;
                     consecutive_errors = 0;
                     g_elm_stuck = 0;
-                    g_last_resp_ms = 0;   /* no arrastrar el hueco tras un corte */
+                    g_elm_window = 0;
+                    /* Sin esto, el primer comando tras el corte mediria un
+                     * hueco enorme contra la ultima respuesta del enlace
+                     * que acaba de morir (fase2.45). */
+                    g_last_resp_ms = 0;
+                    g_no_data_streak = 0;
 
                     /* D3: en lugar de bloquear 2 s y reconectar en el
                      * sitio (congelaba la GUI y dejaba el socket en un
@@ -7923,45 +11073,43 @@ static void run_dashboard(Target *targets, int target_count)
                          reconn_tries, RECONN_MAX_TRIES);
                 net_ui_set(msg);
 
-                /* FASE 2.12: si el adaptador esta atascado en STOPPED,
-                 * el socket aun esta abierto. Se prueba ATZ antes de
-                 * desconectar el WiFi. connect_network_and_elm() hace
-                 * obd_store_init() y boost_init() al entrar, asi que se
-                 * guardan ambos estados por valor para no perder los
-                 * ultimos valores medidos. */
+                /* FASE 2.12: con el adaptador atascado el socket sigue
+                 * abierto. Se prueba ATZ sobre el antes de desconectar el
+                 * WiFi; connect_network_and_elm() limpia el almacen al
+                 * entrar, asi que los ultimos valores se guardan por valor
+                 * y se devuelven si el ATZ contesta. */
                 if (g_try_atz && sock >= 0) {
-                    obd_sample_store saved_store = g_store;
-                    boost_state saved_boost = g_boost;
                     elm_reply r;
-                    int atz_ok = 0;
+
                     g_try_atz = 0;
+                    memset(&r, 0, sizeof(r));
+                    /* El socket es el de un enlace que acaba de morir: lo
+                     * que quedase sin leer (un frame tardio del K-line, los
+                     * STOPPED del clon atascado) se leeria como respuesta
+                     * del ATZ y daria el adaptador por bueno sin serlo. */
+                    elm_flush_input(sock);
                     elm_send_and_read(sock, "ATZ", 1500, &r);
                     if (r.bytes > 0 && !r.stopped) {
                         log_file_printf("Recuperacion: ATZ OK\n");
-                        log_sync();
-                        atz_ok = 1;
-                        /* connect_network_and_elm() abre un socket NUEVO.
-                         * Si no cerramos este, el clon (tipicamente
-                         * unico cliente) rechaza la segunda conexion y
-                         * se cae al ciclo WiFi de 10-30 s que queriamos
-                         * evitar. Ademas fugaba un fd por recuperacion. */
-                        sceNetInetClose(sock);
-                        sock = -1;
                     } else {
                         log_file_printf("Recuperacion: ATZ fallo -> WiFi\n");
-                        log_sync();
-                        sceNetInetClose(sock);
-                        sock = -1;
                     }
-                    /* En los dos caminos se rehace el handshake y el
-                     * planificador, con connect_network_and_elm(). */
+                    log_sync();
+                    /* connect_network_and_elm() abre un socket NUEVO: si
+                     * no se cierra este, el clon (unico cliente) rechaza la
+                     * segunda conexion y fuga un descriptor por intento. */
+                    sceNetInetClose(sock);
+                    sock = -1;
                     sock = connect_network_and_elm(targets, &target_count, 0);
-                    if (sock >= 0 && atz_ok) {
-                        g_store = saved_store;
-                        g_boost = saved_boost;
-                    }
                 } else {
                     sock = connect_network_and_elm(targets, &target_count, 0);
+                }
+                /* El intento no conecto y el almacen esta vacio: vuelven
+                 * los ultimos valores medidos para que los cuadros no se
+                 * queden en N/D entre reintentos. */
+                if (sock < 0) {
+                    g_store = g_keep_store;
+                    g_boost = g_keep_boost;
                 }
                 now = now_ms();
                 if (sock >= 0) {
@@ -7970,15 +11118,19 @@ static void run_dashboard(Target *targets, int target_count)
                     consecutive_timeouts = 0;
                     consecutive_errors = 0;
                     g_elm_stuck = 0;
+                    g_no_data_streak = 0;
                     last_rtt = -1;
-                    g_hist_count = 0;
-                    g_hist_pos = 0;
-                    g_hist_last = 0;
+                    hist_reset();
                     last_status = now;
                     log_file_printf("Auto-reintento OK\n");
                     log_sync();
                 } else if (reconn_tries >= RECONN_MAX_TRIES) {
                     reconn_active = 0;
+                    /* Sin esto el cartel de SIN ADAPTADOR se quedaba para
+                     * siempre y la barra seguia diciendo CONECT estando
+                     * desconectado: el flag de ocupado solo se limpiaba en
+                     * los caminos que si conectan. */
+                    g_net_busy = 0;
                     net_ui_set("SIN ADAPTADOR");
                     log_file_printf("Auto-reintento agotado\n");
                     log_sync();
@@ -8003,21 +11155,21 @@ static void run_dashboard(Target *targets, int target_count)
         int draw_due = ((uint32_t)(vc - g_perf_last_vcount) >=
                         (uint32_t)(target_vb - 1));
 
-        /* FASE F (correccion tras phase1_076/077): el hueco minimo del
-         * ELM327 tiene prioridad sobre el dibujado. Antes se comprobaba
-         * `draw_due` primero y, como un frame tarda ~33 ms, el hueco
-         * configurado de 8 ms se media como 41 ms: la capacidad cayo de
-         * ~12 a ~10 peticiones/s. Con el order invertido el hueco real
-         * es de 8-10 ms y el dibujo se recupera en el siguiente VBlank. */
         if (gap_pending) {
+            /* El hueco minimo del ELM327 manda sobre el dibujado. Antes se
+             * comprobaba primero el frame y, como un frame tarda ~33 ms, el
+             * hueco de 8 ms se medía como 41: la capacidad caia de ~12 a
+             * ~10 peticiones/s (fase2.44 del repo original). El dibujo se
+             * recupera en el siguiente VBlank; su cadencia no depende de
+             * esto. */
             sceKernelDelayThread(2000);
         } else if (draw_due) {
             draw_screen(now, requests, data_count,
                         no_data_count, timeouts, last_rtt);
         } else if (rx.active || rx_just_done) {
-            /* Con una peticion en vuelo se duerme 2 ms en vez de un
-             * VBlank (16,7 ms). La cadencia del dibujo no depende del
-             * bucle, sino de la cuenta de VBlanks. */
+            /* Con una peticion en vuelo se duerme 2 ms en vez de un VBlank
+             * (16,7 ms). El dibujo no se resiente: su cadencia sigue la
+             * cuenta de VBlanks, no la del bucle. */
             sceKernelDelayThread(2000);
         } else {
             /* Nada que dibujar: un VBlank como referencia. */
@@ -8028,24 +11180,26 @@ static void run_dashboard(Target *targets, int target_count)
         if ((uint32_t)(now - last_status) >= 2000u) {
             float f;
             char rpm[16] = "N/D";
+            char maf[16] = "N/D";
             char map[16] = "N/D";
             char boost[16] = "N/D";
             char ect[16] = "N/D";
             char iat[16] = "N/D";
             char spd[16] = "N/D";
 
-            if (sample_value(0x0C, now, &f)) fmt_0(rpm, sizeof(rpm), f);
-            if (sample_value(0x0B, now, &f)) fmt_0(map, sizeof(map), f);
+            if (sample_value_raw(0x0C, now, &f)) fmt_0(rpm, sizeof(rpm), f);
+            if (sample_value_raw(0x10, now, &f)) fmt_1(maf, sizeof(maf), f);
+            if (sample_value_raw(0x0B, now, &f)) fmt_0(map, sizeof(map), f);
             if (g_boost.boost_valid) fmt_1(boost, sizeof(boost), g_boost.boost_bar);
-            if (sample_value(0x05, now, &f)) fmt_0(ect, sizeof(ect), f);
-            if (sample_value(0x0F, now, &f)) fmt_0(iat, sizeof(iat), f);
-            if (sample_value(0x0D, now, &f)) fmt_0(spd, sizeof(spd), f);
+            if (sample_value_raw(0x05, now, &f)) fmt_0(ect, sizeof(ect), f);
+            if (sample_value_raw(0x0F, now, &f)) fmt_0(iat, sizeof(iat), f);
+            if (sample_value_raw(0x0D, now, &f)) fmt_0(spd, sizeof(spd), f);
 
-            log_file_printf("t=%u rpm=%s map=%s boost=%s ect=%s iat=%s "
-                            "spd=%s rtt=%d gap=%d gapcfg=%d ok=%d nd=%d "
-                            "to=%d fps=%d "
+            log_file_printf("t=%u rpm=%s maf=%s map=%s boost=%s ect=%s "
+                            "iat=%s spd=%s rtt=%d gap=%d gapcfg=%d ok=%d "
+                            "nd=%d to=%d fps=%d "
                             "cpu=%u wait=%u int=%u vb=%d v=%d%s\n",
-                            (unsigned)(session_ms / 1000), rpm, map,
+                            (unsigned)(session_ms / 1000), rpm, maf, map,
                             boost, ect, iat, spd, last_rtt,
                             (int)(gap_n ? (gap_acc / gap_n) : 0),
                             g_elm_min_gap_ms,
@@ -8058,6 +11212,80 @@ static void run_dashboard(Target *targets, int target_count)
                             g_demo ? " (SIM)" :
                             (sock >= 0 ? "" : " (offline)"));
             last_status = now;
+            /* La linea de estado sale una vez por segundo: escritura a
+             * la tarjeta tambien cada segundo. Si la app muere sin
+             * cerrar, se pierde como mucho el ultimo segundo de log. */
+            log_sync();
+            /* Un cambio de pantalla se escribe una sola vez, y solo si la
+             * pantalla lleva unos segundos quieta: repasar las pantallas con
+             * L/R no debe escribir la tarjeta en cada paso. */
+            if (g_last_saved_mode != g_mode) {
+                if (g_mode_since_ms == 0) {
+                    g_mode_since_ms = now;
+                } else if ((uint32_t)(now - g_mode_since_ms) >= 5000u) {
+                    g_last_saved_mode = g_mode;
+                    g_mode_since_ms = 0;
+                    settings_save();
+                }
+            } else {
+                g_mode_since_ms = 0;
+            }
+
+            /* FASE K2: cada ventana de 10 s se compara lo pedido con lo
+             * entregado. Solo en K-line: en CAN la tabla ya cabe en el
+             * presupuesto y ese coche no puede depender de una medida. */
+            if (obd_vehicle_proto_class(g_proto) != OBD_PROTO_CAN) {
+                if (last_rtt > 0) {
+                    g_link_service_ms = (uint16_t)last_rtt;
+                }
+                if (g_cap_window_ms == 0) {
+                    g_cap_window_ms = now;
+                    g_cap_window_reqs = requests;
+                } else if ((uint32_t)(now - g_cap_window_ms) >= 10000u) {
+                    uint32_t elapsed = (uint32_t)(now - g_cap_window_ms);
+                    float rate = (float)(requests - g_cap_window_reqs) *
+                                 1000.0f / (float)elapsed;
+                    float ceiling = obd_profile_link_class(OBD_PROTO_KLINE);
+                    float base = (g_link_measured > 0.0f) ? g_link_measured
+                                                          : ceiling;
+                    /* Contra lo que el plan decidio gastar, no contra lo
+                     * que la tabla pediria: con el plan comprimido la
+                     * demanda siempre supera al presupuesto, asi que
+                     * comparar con ella recortaba la capacidad en cada
+                     * ventana y la dejaba en bucle cuesta abajo (2,20 ->
+                     * 0,80 req/s en una sesion con el enlace entregando
+                     * 2,30). */
+                    float asked = (g_plan_demand < g_link_plan.budget)
+                                      ? g_plan_demand
+                                      : g_link_plan.budget;
+                    float next = g_link_measured;
+                    if (!g_cap_warmup) {
+                        next = obd_capacity_next(base, rate, asked, ceiling);
+                    } else {
+                        /* La primera ventana tras conectar no cuenta: los
+                         * PID que no estan en pantalla llegan aplazados, asi
+                         * que entrega menos de lo que pide el plan sin que
+                         * el enlace tenga nada. Medirla recortaba la
+                         * capacidad en el primer tramo y costaba siete
+                         * ventanas volver. */
+                        g_cap_warmup = 0;
+                        log_file_printf("Enlace: primera ventana, sin medir\n");
+                    }
+                    if (next != g_link_measured) {
+                        g_link_measured = next;
+                        log_file_printf(
+                            "Enlace: %.2f req/s entregadas, pedidas %.2f; "
+                            "plan %.2f req/s (%s)\n",
+                            rate, asked, g_link_measured,
+                            g_link_plan.compressed ? "comprimido" : "holgado");
+                        log_sync();
+                        apply_screen_schedule(now);
+                    }
+                    g_cap_window_ms = now;
+                    g_cap_window_reqs = requests;
+                }
+            }
+
             gap_acc = 0;
             gap_n = 0;
         }
@@ -8076,6 +11304,25 @@ static void run_dashboard(Target *targets, int target_count)
 
     log_file_printf("Fin de sesion: peticiones=%d datos=%d nd=%d to=%d\n",
                     requests, data_count, no_data_count, timeouts);
+
+    /* Resumen de una tacada: es lo unico que hay que leer del log para saber
+     * como fue la sesion, sin buscar entre cientos de lineas. */
+    log_file_printf("=== RESUMEN ===\n");
+    log_file_printf("Vehiculo: %s%s%s tacometro=%d rojo=%d corte=%d\n",
+                    g_vehicle_name[0] ? g_vehicle_name : "sin perfil",
+                    g_cfg.profile[0] ? " (forzado " : "",
+                    g_cfg.profile[0] ? ")" : "",
+                    (int)tach_max_rpm(), (int)redline_rpm(), g_profile_cut);
+    log_file_printf("Enlace: %.2f req/s medidas, plan %.2f req/s (%s)\n",
+                    g_link_measured, g_link_plan.budget,
+                    g_link_plan.compressed ? "comprimido" : "holgado");
+    log_file_printf("FALLOS: lampara=%d guardados=%d pendientes=%d "
+                    "permanentes=%d\n",
+                    g_dtc_mil, g_dtc_stored_n, g_dtc_pending_n,
+                    g_dtc_permanent_n);
+    log_file_printf("Sesion: %u s, reconexiones=%d, caidas=%d\n",
+                    (unsigned)((now_ms() - g_session_start_ms) / 1000u),
+                    reconnects, link_losses);
     log_sync();
 }
 
@@ -8087,14 +11334,32 @@ int main(void)
 {
     setup_exit_callback();
 
-    /* Solo archivo: la pantalla grafica es lo primero que se ve. */
-    log_open();
-    log_file_printf("PSP Torque - fase 2\n");
-    log_file_printf("build: %s\n", BUILD_TAG);
-    log_file_printf("log: %s\n\n", g_log_path);
+    /* El EBOOT puede estar instalado en cualquier carpeta, pero los
+     * datos (log, ajustes, host.txt) van siempre a LOG_DIR. Si esa
+     * carpeta no existe no se escribia nada y nadie avisaba: se crea. */
+    sceIoMkdir("ms0:/PSP/SAVEDATA", 0777);   /* el firmware la crea */
+    sceIoMkdir(LOG_DIR, 0777);
 
-    /* Paleta y estado inicial, aun sin GU. */
+    /* Los ajustes primero: el propio ajuste LOG decide si hay archivo, y
+     * abrirlo para cerrarlo acto seguido dejaria el archivo vacio en la
+     * tarjeta. */
     settings_load();
+
+    log_open();
+    log_banner();
+    settings_log_summary();
+    proto_load();
+    /* Se arranca donde se quedo, pero solo si era una pantalla de
+     * conduccion: abrir siempre en SNIFFER no sirve al conducir. */
+    /* start= manda; si no hay, la ultima pantalla de conduccion. */
+    if (g_start_mode >= 0 && g_start_mode < MODE_COUNT) {
+        g_mode = g_start_mode;
+    } else {
+        g_mode = mode_is_driving(g_last_mode) ? g_last_mode : MODE_QV;
+    }
+    /* Ya esta en disco: no hace falta reescribirlo en el primer tick. */
+    g_last_saved_mode = g_mode;
+    log_file_printf("Pantalla inicial: %s\n", mode_name(g_mode));
     obd_store_init(&g_store);
     boost_init(&g_boost, PROFILE_BARO_FALLBACK_KPA);
 
@@ -8173,7 +11438,9 @@ int main(void)
                "fallback EST");
 
     char result[48];
-    if (g_summary.data_count > 10 && g_summary.link_losses == 0) {
+    if (g_demo) {
+        snprintf(result, sizeof(result), "SIM (sin coche)");
+    } else if (g_summary.data_count > 10 && g_summary.link_losses == 0) {
         snprintf(result, sizeof(result), "OK");
     } else if (g_summary.data_count > 10) {
         snprintf(result, sizeof(result), "OK (%d cortes)",
@@ -8182,7 +11449,7 @@ int main(void)
         snprintf(result, sizeof(result), "INCOMPLETO");
     }
     log_printf("RESULTADO: %s\n", result);
-    log_printf("Log: %s\n", g_log_path);
+    log_printf("Log: %s\n", g_log_path[0] ? g_log_path : "desactivado");
     log_printf("\nSTART: salir\n");
     log_sync();
 

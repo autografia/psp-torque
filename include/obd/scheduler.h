@@ -18,6 +18,10 @@ typedef struct {
     obd_poll_item items[OBD_SCHED_MAX];
     int count;
     int in_flight;         /* indice o -1 */
+    /* FASE K2: con el enlace comprimido se sirve por prioridad y, dentro
+     * de la misma, por vencimiento. Sin comprimir se queda en EDF puro,
+     * que es lo que usan los coches rapidos y lo que habia antes. */
+    int strict;
 } obd_scheduler;
 
 void obd_sched_init(obd_scheduler *sched);
@@ -38,11 +42,31 @@ void obd_sched_begin(obd_scheduler *sched, int idx, uint32_t now_ms);
 void obd_sched_set_period(obd_scheduler *sched, int idx, uint16_t period_ms,
                           int due_now);
 
+/* Aplaza un PID que ya esta vencido: le da su proximo turno dentro del
+ * segundo tramo de su periodo, con un hueco que depende del PID para que
+ * dos aplazados no vuelvan a la vez. Se usa con los PID que no estan en
+ * pantalla cuando la tabla se acaba de montar, para que su primer turno
+ * no se coma el enlace que necesita el RPM (en phase1_012 siete PID
+ * fuera de pantalla se llevaron 19 de las 151 peticiones del primer
+ * minuto).
+ *
+ * No hace nada si el PID ya tiene un turno en el futuro, si esta en
+ * vuelo, si esta marcado como no soportado o si su periodo es menor que
+ * 2 ms (no hay tramo donde repartirlo). */
+void obd_sched_defer(obd_scheduler *sched, int idx, uint32_t now_ms);
+
 /* Cierra la peticion: reprograma y cuenta NO DATA. */
 void obd_sched_end(obd_scheduler *sched, int idx, uint32_t now_ms,
                    int got_data);
 
 void obd_sched_set_supported(obd_scheduler *sched, int idx, int supported);
+
+/* Cambia la prioridad de un PID en caliente (0 = mas alta). No toca ni el
+ * periodo ni el vencimiento. */
+void obd_sched_set_priority(obd_scheduler *sched, int idx, uint8_t priority);
+
+/* 1 = servir por prioridad antes que por vencimiento. */
+void obd_sched_set_strict(obd_scheduler *sched, int strict);
 
 /* Marca todos los PID no soportados segun la mascara del bloque.
  * first_pid = 0x01, 0x21, 0x41... Devuelve cuantos ha cambiado. */
@@ -50,6 +74,10 @@ int obd_sched_apply_mask(obd_scheduler *sched, uint32_t mask,
                          uint8_t first_pid);
 
 /* Reagenda todo (cambio de modo, reconexion). */
+/* Marca pendientes de inmediato todos los PID soportados. La app ya no lo
+ * usa (build_scheduler() deja la tabla entera pendiente): marcarlos todos
+ * es justo lo que hacia que los PID fuera de pantalla se comieran el
+ * primer minuto del enlace. Queda para los tests. */
 void obd_sched_reset_due(obd_scheduler *sched, uint32_t now_ms);
 
 #endif

@@ -1,0 +1,165 @@
+# Development environment
+
+How this app is built, tested and installed on the current development machine
+(Windows with WSL). The repository's `tools/build.ps1` drives Docker, which is not
+installed here; what follows works without it.
+
+## 1. Toolchain
+
+The official pspdev toolchain is published as a tarball on GitHub. It does not run on
+Ubuntu 22.04 (it needs glibc 2.38 and that release ships 2.35), so use an
+**Ubuntu-24.04** WSL distribution:
+
+```powershell
+wsl --install -d Ubuntu-24.04 --no-launch
+```
+
+Inside the distribution (as root; no user account needed):
+
+```sh
+apt-get update && apt-get install -y make gcc
+cd /root
+curl -sL -o pspdev.tar.gz https://github.com/pspdev/pspdev/releases/download/v20261101/pspdev-ubuntu-latest-x86_64.tar.gz
+mkdir -p pspdev && tar xzf pspdev.tar.gz -C pspdev --strip-components=1
+```
+
+`PSPDEV` is what points the Makefile at the toolchain: it defaults to
+`/usr/local/pspdev` and derives `psp/sdk/lib/build.mak` from it.
+
+## 2. Building
+
+The repository lives on the Windows disk, so build from a copy on the Linux filesystem
+(faster than `/mnt/c`):
+
+```sh
+rm -rf /root/work/psp-torque-fork
+cp -r /mnt/c/Users/void/psp/psp-torque-fork /root/work/psp-torque-fork
+cd /root/work/psp-torque-fork
+export PATH=/root/pspdev/bin:$PATH
+make clean PSPDEV=/root/pspdev
+make PSPDEV=/root/pspdev
+```
+
+- **Zero warnings** under `-Wall -Wextra -std=c99`. A new warning is a failure.
+- `make clean` also needs `PSPDEV`: without it the Makefile cannot find `build.mak` and
+  fails before doing anything.
+- The output is `EBOOT.PBP` in the repository root, with a `PARAM.SFO` generated at
+  `MEMSIZE=2` (the pspdev default).
+
+### Building on a machine that is not this one
+
+Everything needed is in the repository and on GitHub, so a fresh machine (cloud or
+otherwise) starts with a clone and the toolchain:
+
+```sh
+git clone https://github.com/konqiDAM/psp-torque.git
+cd psp-torque
+git checkout feat/sonda-diagnostico     # the branch under development
+# toolchain as in section 1, then:
+export PATH=/root/pspdev/bin:$PATH
+make PSPDEV=/root/pspdev && make -C tests clean all
+```
+
+### Without root (Debian/Ubuntu where you cannot apt-get install)
+
+On a machine where you have no root, everything above still works if the packages are
+unpacked into `~/.local` with `dpkg-deb -x` instead of installed. That is how
+`capy-homelab` builds this repository:
+
+```sh
+cd /tmp
+apt-get download make gcc-14 gcc-14-x86-64-linux-gnu cpp-14-x86-64-linux-gnu \
+    binutils binutils-x86-64-linux-gnu libbinutils binutils-common libc6-dev \
+    libgcc-14-dev libgcc-s1 linux-libc-dev libisl23 libzstd1 libmpc3 libgmp10 \
+    libmpfr6 libsframe1 libctf0 libctf-nobfd0 zlib1g
+for d in *.deb; do dpkg-deb -x "$d" ~/.local; done
+```
+
+Two details make the unpacked compiler work: the linker resolves the absolute paths
+inside `libc.so` through `--sysroot=$HOME/.local`, and the runtime libraries it needs
+(`libc.so.6`, `libm.so.6`, `libmvec.so.1`) are symlinked into the sysroot from the host.
+`~/bin/hostcc` wraps that, so `make -C tests all CC=$HOME/bin/hostcc` just works.
+
+The pspdev tarball needs `libmpc`, `libgmp` and `libmpfr` at run time; the same
+`LD_LIBRARY_PATH=$HOME/.local/usr/lib/x86_64-linux-gnu` covers them.
+
+The build needs nothing from the Windows machine: no `/mnt/c`, no PSP, no PPSSPP. Only
+the toolchain tarball and the clone. `make -C tests` prints `OK: todas las pruebas pasan`.
+
+## 3. Core tests
+
+These need no PSP toolchain, only a host compiler:
+
+```sh
+make -C tests clean all
+```
+
+It prints `OK: todas las pruebas pasan` plus a line with the per-screen demand. Any
+change under `src/core/` or to the period table comes with its own test here.
+
+## 4. Testing without a PSP (PPSSPP)
+
+PPSSPP is installed at `C:/Program Files/PPSSPP`. Its memory stick is
+`C:/Users/void/Documents/PPSSPP/PSP`, with the same layout as the console (`GAME`,
+`SAVEDATA`, `SYSTEM`).
+
+- An EBOOT can be launched directly: `PPSSPPWindows64.exe path\EBOOT.PBP`.
+- Keyboard bindings live in `Documents/PPSSPP/PSP/SYSTEM/controls.ini`. Useful codes:
+  Cross = 54 (`Z`), Circle = 52 (`X`), Square = 29 (`A`), Triangle = 47 (`S`),
+  L = 45 (`Q`), R = 51 (`W`), Start = 62 (space).
+- The app's log appears in `Documents/PPSSPP/PSP/SAVEDATA/PSPTORQUE`. That is the cheap
+  way to confirm a new screen draws and the log writes, before touching hardware.
+
+## 5. Installing on the PSP
+
+The PSP appears as a removable drive (here `F:`). The app lives at:
+
+```
+F:/PSP/GAME/HOMEBREW/psp-torque/EBOOT.PBP
+```
+
+Data (log, settings, host file, chime) goes to `F:/PSP/SAVEDATA/PSPTORQUE/`, which the
+app creates itself. Nothing else needs copying.
+
+After copying, press `O` on the console to leave USB mode before unplugging.
+
+`LOG` in the settings menu has three positions (`log=` in `settings.txt`):
+
+| valor | qué escribe | cuándo |
+|---|---|---|
+| 0 | nada: no se abre archivo | feria o un viaje del que no hace falta reconstruir nada |
+| 1 | arranque, líneas de estado cada 2 s, resumen final | lo mínimo para saber cómo fue la sesión |
+| 2 (por defecto) | además cada comando y cada respuesta | reconstruir una sesión, como hasta ahora |
+
+Con `log=2`, a los 1,9 req/s del coche de K-line eso son unos 9 KB por minuto, que una
+Memory Stick no nota. Con `log_full=` en un archivo antiguo se lee como `log=2`, y
+`log_full=0` como `log=1`, así que una tarjeta de antes sigue funcionando sin tocar nada.
+
+El demo es del MX-5 NB2 desde `fase2.68` (`demo_update` en `main.c`): el régimen sale de
+la velocidad y de las relaciones del cambio de seis marchas, el MAF del caudal que pide
+ese régimen, el MAP es de atmosférico y el agua se queda en 88-92 °C. Si el arranque no
+encuentra adaptador, entra solo (`demo_if_no_adapter`), y el primer `TRIANGLE` que conecte
+lo apaga.
+
+The end of every session carries a `=== RESUMEN ===` block with the detected car, the
+measured link capacity and plan, the fault-code state and the session counters. Read that
+first; the rest of the file is the detail behind it.
+
+
+
+The log is written every second, so it survives even an abrupt shutdown:
+
+```
+F:/PSP/SAVEDATA/PSPTORQUE/phase1_AAAAMMDD_HHMMSS.log
+```
+
+If the console clock is unset it numbers sequentially instead (`phase1_001.log`,
+`phase1_002.log`…). Prefer exiting with `START > SALIR > X`.
+
+## 7. Git
+
+- `konqiDAM/psp-torque` is the fork we work in; `autografia/psp-torque` is the original,
+  which will receive a pull request once there is something to review.
+- One branch per piece of work. Commit messages are in English from now on, while the
+  existing history is Spanish.
+- The current K-line branch is `feat/sonda-diagnostico`.
