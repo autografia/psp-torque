@@ -13,10 +13,17 @@ void test_samples(void);
 void test_discovery(void);
 void test_smooth(void);
 void test_set_period(void);
-void test_forced_set(void);
+void test_sched_defer(void);
+void test_oil(void);
 void test_alert_invalid_data(void);
 void test_alert_thresholds(void);
 void test_alert_priority(void);
+void test_forced_set(void);
+void test_vehicle(void);
+void test_scheduler_strict(void);
+void test_plan(void);
+void test_dtc(void);
+void test_splash_mx5(void);
 
 int g_failures = 0;
 
@@ -131,6 +138,7 @@ int main(void)
     test_pid();
     test_boost();
     test_scheduler();
+    test_scheduler_strict();
     test_samples();
     test_discovery();
     test_profile();
@@ -139,10 +147,16 @@ int main(void)
     test_demand_by_screen();
     test_smooth();
     test_set_period();
-    test_forced_set();
+    test_sched_defer();
+    test_oil();
     test_alert_invalid_data();
     test_alert_thresholds();
     test_alert_priority();
+    test_forced_set();
+    test_vehicle();
+    test_plan();
+    test_dtc();
+    test_splash_mx5();
 
     if (g_failures != 0) {
         printf("%d comprobaciones fallidas\n", g_failures);

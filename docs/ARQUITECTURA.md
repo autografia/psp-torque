@@ -225,9 +225,143 @@ Un filtro exponencial con factor de mezcla fijo tiene un retardo que depende
 de la cadencia de muestreo: con factor 0,3 y RPM a 1,3 Hz, el indicador
 tardaba **2,1 s** en llegar al 63% del valor real. Ese era el retardo visible.
 
-El filtro del núcleo (`obd_smooth`) usa constante de tiempo fija
-(`tau = 150 ms`): `alpha = 1 - exp(-dt/tau)`. El retardo es siempre `tau`,
-venga la cadencia como venga.
+El filtro del núcleo (`obd_ease_apply`) usa constante de tiempo fija
+(`alpha = 1 - exp(-dt/tau)`): el retardo es siempre `tau`, venga la cadencia
+como venga. **El filtro ya no se aplica al guardar la muestra** (fase2.63): se
+aplica al pintar, y solo al pintar (5.5b).
+
+### 5.5b AGUJA y REPARTO: lo que se mueve y lo que se pide (fase2.63)
+
+La predicción de `fase2.61`-`fase2.62` ya no existe. El dueño la vio en el
+coche: adelantaba peor que la rampa, porque con el RPM volviendo cada ~1,1 s
+cualquier velocidad estimada con dos muestras o se queda corta o se pasa, y al
+llegar la medida real la aguja saltaba. Lo que quedó es más simple de explicar
+y de comprobar: **la aguja se acerca a la última medida, y ahí se queda.** No
+hay nada en pantalla que el coche no haya dicho: el ease solo mueve las dos
+agujas (tacómetro y velocímetro), y todo lo demás — números, barras, gráfica,
+máximos, marcha, avisos — se pinta con la medida tal cual.
+
+**AGUJA** (ajuste del menú, `aguja=` en `settings.txt`):
+
+| valor | qué hace | `tau` |
+|---|---|---|
+| 0 DIRECTA | se pinta la medida tal cual llega | — |
+| 1 SUAVE (por defecto) | ease hasta la medida, cuadro a cuadro | 150 ms |
+| 2 MUY SUAVE | lo mismo, más lento | 400 ms |
+
+El ease corre en `sample_value_needle()` con un `obd_smooth` por PID y se mueve
+con el reloj del fotograma, no con el de las muestras: la aguja no se queda
+quieta entre dos muestras ni salta al llegar la siguiente. Dos llamadas en el
+mismo milisegundo no mueven nada (`alpha = 0`), que es la red por si alguien
+lee la misma aguja dos veces en un fotograma; hoy la lee una sola vez.
+
+**REPARTO** (ajuste del menú, `reparto=`): cuántos valores de pantalla entran
+en el reparto rápido del enlace, de 0 a 4. Cada valor visible reserva su suelo
+(0,2 Hz dentro del cupo, 0,1 Hz fuera) y el RPM se lleva el resto. Tabla del
+plan con el presupuesto de la MX-5 (2,125 req/s tras el 85 % de 2,5 y 383 ms por
+petición) y cinco valores pintados en el GENERAL — **aritmética, no medida**:
+
+| REPARTO | RPM: periodo | RPM: una muestra cada | cupo | resto |
+|---|---|---|---|---|
+| 0 | 200 ms (suelo de la tabla) | 583 ms | — | 10,4 s |
+| 1 | 232 ms | 615 ms | 5,0 s | 10,4 s |
+| 2 | 273 ms | 656 ms | 5,0 s | 10,4 s |
+| 3 (por defecto) | 319 ms | 702 ms | 5,0 s | 10,4 s |
+| 4 | 372 ms | 755 ms | 5,0 s | 5,0 s |
+
+(La tabla es del GENERAL de fábrica de la MX-5, que pinta cuatro valores con
+PID propio: velocidad, MAF, aire de admisión y avance; la marcha es derivada y
+no pide nada. Una vista guardada con cinco huecos con PID sube un paso: 615 /
+656 / 702 / 755 / 816 ms.)
+
+Reglas que acompañan al reparto:
+
+- **El reparto pide el presupuesto exacto en el rango normal**: RPM + cupo +
+  resto suman `budget`. Es la condición que fija
+  `test_plan_never_oversubscribes()`, barriendo capacidades de 1,2 a 2,5 req/s y
+  de 1 a 10 valores, y la que faltaba cuando los valores lentos se pagaban
+  aparte (llegó a pedir 1,7 veces el presupuesto en el DIAG). La excepción está
+  en el suelo de capacidad (≤ 1,2 req/s): el RPM se queda el presupuesto entero
+  y cada valor visible cae al suelo absoluto de 10 s o al tope de 60 s, así que
+  la suma se pasa como mucho `n × 1/60` — a propósito, porque el planificador
+  sirve al RPM primero y un cuadro en `N/D` no le sirve a nadie.
+- Solo cuentan los valores que **se pintan**, no todo lo que el perfil marca
+  como visible: en `phase1_010` entraban trece PID en el reparto y el RPM se
+  quedaba con las sobras. En las pantallas con huecos configurables (GENERAL y
+  TELEMETRÍA) manda lo que hay en los huecos; en las demás, la máscara del
+  perfil para esa pantalla.
+- El cupo se reparte **por importancia**, no por orden de la tabla: velocidad,
+  carga (MAP/MAF), avance, mariposa, temperaturas y el resto (`pid_priority()`
+  en `main.c`). Con REPARTO 3 en el GENERAL el que se queda lento es el aire de
+  admisión, no el avance.
+- Un valor visible sin presupuesto no cae al periodo de fondo: se queda en
+  10 s (`PROFILE_PLAN_VALUE_SLOW_MS`), dentro de la ventana de caducidad de
+  30 s. Fuera de pantalla sí, una petición por minuto.
+- El techo de la clase K-line sube de 2,2 a 2,5 req/s
+  (`PROFILE_LINK_CLASS_KLINE`): la MX-5 ya entregó 2,50 sostenidos en
+  `phase1_010` (`Enlace: 2.50 req/s entregadas`) y el techo físico con 383 ms es
+  2,61. Sigue siendo una estimación: la capacidad real la mueve
+  `obd_capacity_next` con lo medido.
+
+Lo que no cambió:
+
+- La antigüedad y el `N/D` se miden con la marca de la muestra, y caducan a los
+  tres intervalos del PID tomando el **mayor** entre el intervalo real medido
+  (media móvil del hueco entre muestras) y el que promete el plan, con suelo de
+  6 s y techo de 30. El ease no alarga la vida de un dato: si caduca, su filtro
+  se reinicia y al volver la aguja arranca en la medida nueva.
+- `sample_value_raw()` es la lectura exacta, y es la que usan el log de estado,
+  el número del tacómetro, todos los números y barras del cuadro, el indicador
+  de marcha, los avisos de cambio y rojo, el aprendizaje del turbo y el
+  historial de la gráfica. Desde `fase2.63` el almacén guarda la medida **tal
+  cual llegó** (`store_value()` ya no filtra): la evidencia y los máximos no
+  pueden ser la animación.
+
+### 5.5c El GENERAL de la MX-5: lo que pinta y lo que calcula (fase2.67)
+
+El GENERAL es la misma rejilla para todos los coches, pero un coche sin MAP
+sensor no puede enseñar el centro del cuadro de un turbo. Las sustituciones
+las decide el perfil (`slot_item_eff`), y desde `fase2.67` **también se
+aplican con una vista guardada**, no solo con la de fábrica: antes, en cuanto
+la tarjeta guardaba la vista del coche, volvía a salir un BOOST alimentado por
+el estimador.
+
+Con la MX-5 la rejilla queda así (las posiciones no cambian; solo el bloque
+de la derecha):
+
+| Hueco | Coche con MAP | MX-5 |
+|---|---|---|
+| 0, 212×146 | RPM | RPM |
+| 1, 244×64 | VELOCIDAD (tira ancha) | VELOCIDAD, dial en 124×146 |
+| 2, 244×74 | BOOST (barra) | bloque AIRE / ACEITE / AGUA en 116×146 |
+| 3, 152×80 | ECT | MARCHA |
+| 4, 152×80 | IAT | IAT |
+| 5, 144×80 | MAP | AVANCE |
+
+El bloque (`W_AUX`) pinta tres filas iguales: MAF en g/s, la presión de aceite
+calculada y el agua. Necesita dos PID (0x10 y 0x05) y el plan los pide cuando
+el bloque está en pantalla, aunque el hueco solo declare uno.
+
+**La presión de aceite no existe como sensor** en el NB2: el cuadro de fábrica
+lleva un manómetro que la ECU mueve por revoluciones. Aquí se replica con una
+curva (`obd_oil_bar()`, en `src/core/oil.c`) y se marca `EST` al lado del
+número:
+
+| | ralentí | 2000 rpm | 5000 rpm |
+|---|---|---|---|
+| agua ≤ 80 °C (frío) | 3,5 bar | 4,6 bar | 4,6 bar |
+| agua ≥ 90 °C (caliente) | 1,0 bar | ~2,0 bar | 4,5 bar |
+
+Lineal en medio, y entre 80 y 90 °C se mezclan las dos curvas: si no, el número
+saltaría 2,5 bar justo en el umbral del termostato. Se mueve con un retardo de
+un segundo (la misma ease que la aguja) para que no parpadee al golpear el
+acelerador. Sin lectura de agua se usa la curva fría, que es la que no puede
+hacer pensar que el motor está mejor de lo que está.
+
+Un bloque `v.<coche>` guardado con la rejilla vieja se migra en
+`layout_apply_for_car()` con la misma regla exacta que ya se usaba para las
+series de TELEMETRÍA: solo si el juego es *exactamente* el de fábrica viejo, y
+sin tocar una vista que el dueño haya cambiado.
 
 ### 5.6 Reparto del ancho de banda por pantalla (FASE F3)
 
@@ -248,6 +382,44 @@ activa; fuera de ella se multiplican por 4 con tope de 30 s.
 
 `apply_screen_schedule()` (capa PSP) recalcula los periodos al cambiar de
 pantalla y deja pendientes de inmediato los PID que acaban de aparecer.
+
+### 5.6b Enlace lento: reparto y estimación de capacidad (FASE K2, umbral en 585b75b)
+
+Esa tabla está dimensionada para CAN. En K-line con la que se planifica son
+**2,5 peticiones/s** (`PROFILE_LINK_CLASS_KLINE`, subida desde 2,2 en `fase2.63`;
+383 ms por petición medida en la MX-5 son 2,6 físicos), así que quince PID no
+caben: el plan se comprime y reparte el presupuesto por niveles — RPM, valores
+visibles en la pantalla activa (cuántos, lo decide REPARTO: 5.5b), y fondo.
+
+Hay dos bucles de realimentación y conviene no confundirlos:
+
+1. **Reparto** (`obd_plan_init` + `obd_plan_period`): divide el presupuesto
+   entre lo que pide la pantalla activa. Se recalcula al cambiar de pantalla y
+   cada 10 s.
+2. **Capacidad** (`obd_capacity_next`): compara lo entregado con lo pedido y
+   sube un 10 % por ventana si sobra, o recorta si falta. El recorte está en el
+   70 % de lo pedido, no en el 85 %, porque el plan ya pide solo el 85 % de la
+   capacidad: con el listón en el 85 % un enlace sano se recortaba en cada
+   ventana y el plan oscilaba entre 2,20 y 1,40 req/s (visto en
+   `phase1_008.log`). La primera ventana de cada conexión no se mide: los PID
+   que no están en pantalla llegan aplazados (ver abajo), así que entrega menos
+   de lo que pide el plan sin que el enlace tenga nada, y contarla recortaba la
+   capacidad nada más conectar, que son siete ventanas de subida para
+   recuperarla.
+
+Un PID que **no está en pantalla** no se pide de golpe cuando se monta la tabla:
+llega vencido porque su periodo de fondo arranca caducado, así que
+`obd_sched_defer()` le da su primer turno dentro del segundo tramo de su periodo,
+con un hueco que depende del PID (977 es coprimo con los medios periodos reales,
+así que dos PID distintos no coinciden; con periodos redondos de 10 o 60 s está
+garantizado). Con 60 s de periodo, el primer turno cae entre los 30 y los 60 s.
+En `phase1_012` siete PID fuera de pantalla gastaron 19 de las 151 peticiones
+del primer minuto, enlace que le faltaba al RPM; además, cada guardado de ajustes
+volvía a dispararlos todos, y en una sesión se guarda tres veces. El RPM nunca se
+aplaza (`pid == 0x0C` queda fuera), porque el plan le da su ritmo aunque la aguja
+no esté en un hueco: la marcha y los avisos salen de él. Solo se aplica con el
+plan comprimido: en CAN la tabla base cabe entera y el MiTo no cambia ni el orden
+de sus peticiones.
 Los huecos del GENERAL y las series de TELEMETRIA son configurables:
 cualquier PID puede acabar en pantalla, así que se fuerza su periodo base
 con un conjunto de bytes (`obd_forced_set`) que cubre todo el rango de
@@ -354,3 +526,72 @@ Esto es clave para distinguir “el coche no lo soporta” de “la app lo pide 
 - Conexión simultánea con Torque/AlfaOBD (el ELM327 WiFi suele admitir un
   cliente; además la ECU no multiplexa bien dos maestros de diagnóstico).
 - Bluetooth o USB: la PSP no los soporta de forma práctica para este uso.
+
+## 12. Demo del MX-5 y control del log (fase2.68)
+
+Dos cosas que no tocan el camino de conduccion: con `log=2` (el valor de
+fabrica) el codigo ejecuta exactamente lo de antes, y el demo solo entra por el
+acorde `L`+`R` o cuando el arranque no encuentra adaptador.
+
+**El demo es del coche.** Hasta `fase2.67` simulaba el MiTo 1.4 turbo: MAP como
+fuente de la carga, pedal 0x49 y trims/avance con su codificacion. Ahora simula
+el MX-5 NB2:
+
+- El regimen sale de la velocidad y del cambio: `rpm = km/h x relacion x 36,94`,
+  con las relaciones del NB2 (3,815 / 2,260 / 1,640 / 1,177 / 1,000 / 0,832) y
+  el grupo 4,10 sobre rueda de 205/45R16. Asi el tacometro, el velocimetro y la
+  marcha que calcula la app no pueden contradecirse: es la misma historia.
+- El ciclo dura 90 s y lleva la marcha de cada tramo: ralenti, salida en
+  primera hasta 48 km/h, estirada completa en segunda hasta 82 km/h (6.848 rpm,
+  el corte), tercera hasta 96, quinta de crucero por encima de 100, frenada y
+  parada. Los tramos de 0,6 s son los cambios: el coche levanta el pie y pierde
+  unos km/h mientras sube de relacion.
+- `demo_apply_flags(1)` deja el MAF disponible (0x10) y la mariposa estandar
+  (0x11), con la codificacion normal de trims y avance. El MAP sigue en pie
+  para que el boost del TELEM y la presion de aceite calculada tengan de donde
+  salir.
+- Los valores son de atmosferico: MAP de 30 kPa con la mariposa cerrada a 96 a
+  fondo (los 200 kPa del MiTo en un MX-5 serian una averia), agua a 88-92 grados
+  y avance de 16 grados a fondo a 36 en crucero. El MAF se calcula del regimen y
+  la carga: 3 g/s al ralenti y ~83 a fondo, que es lo que midio la sonda del
+  coche real a 6.900 rpm.
+
+**Sin adaptador no se deja el cuadro en N/D.** `demo_if_no_adapter()` se llama
+tras el intento de conexion del arranque y tras un reintento fallido de
+`TRIANGLE`/`SQUARE`: si no hay socket entra el demo. El chip `DEMO` de la barra
+es el aviso, y el reintento que si conecta llama a `demo_toggle()` antes de
+pedir nada, asi que la medida real manda en cuanto hay coche.
+
+**Lo portado del autor original (fase2.45-2.47).** El enlace y la cabecera
+llevan tres cosas suyas, adaptadas a esta rama:
+
+- Hueco del ELM327: no se ancla en una respuesta `STOPPED` (el adaptador no
+  proceso ese comando) y se pone a cero al cerrar el socket por perdida de
+  enlace, para que el primer comando de la conexion siguiente no se mida contra
+  la ultima respuesta del enlace que acaba de morir.
+- Los `STOPPED` se cuentan en una ventana deslizante de 12 peticiones, no
+  seguidos: en un viaje real aparecen intercalados y un contador de racha no
+  llegaba nunca a los 8 que disparan la reconexion.
+- Aviso global en la cabecera (`obd_alert_eval`): refrigerante a 105/115 C,
+  admision a 70 C y bateria por debajo de 11,5 V, parpadeando en el bloque
+  derecho, en el sitio del estado y el reloj. Y, mientras se reintenta la
+  conexion, el contenido se atenua al 55 % para que se vea que no es de ahora.
+- Los PID lentos (baro cada 30 s) viven sus tres periodos y su caja se atenua
+  en vez de desaparecer; los rapidos siguen con el suelo de 6 s para no pintar
+  una linea plana en la grafica.
+- Reconnecting without losing data: when the cut is a `STOPPED` stall the
+  socket is kept and `ATZ` is tried on it before dropping WiFi, with the last
+  measurements kept by value. The store and the learned boost scale are
+  snapshotted at link loss and restored after any reconnect attempt that does
+  not connect, so a failed WiFi cycle does not blank the tiles. `ATZ` is sent
+  after `elm_flush_input()`, because late frames from the dying link would be
+  read as its answer. With a scheduled reconnect the adapter is not probed (the
+  `STOPPED` count would restart the clock and the reconnect would never run).
+
+**`log=`** tiene tres posiciones: 0 no abre archivo (y por eso no sale el aviso
+`SIN LOG`: apagarlo es una decision), 1 guarda arranque, estado y resumen, y 2
+guarda ademas cada comando y cada respuesta, que es lo que hacia `log_full=1`.
+`settings_load()` corre antes de `log_open()` porque el ajuste decide si hay
+archivo, y `settings_log_summary()` vuelca justo despues del banner las lineas
+que la carga deja anotadas (fichero truncado, migracion de series y el resumen
+`Ajustes: tema=...`).

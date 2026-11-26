@@ -224,75 +224,48 @@ Criterios de aceptacion:
 - [ ] El RPM se refresca a >= 4,5 Hz en el coche y no quedan STOPPED con
       el hueco calibrado.
 
-## Fase 2.9 — Correcciones tras la calibracion en coche (fase2.44)
+## Phase 2.9 - K-line support (PHASE K)
 
-Datos: `phase1_075`..`phase1_078` (19-nov), con `elm_gap=8`.
+Goal: make the app useful in a car that is not the reference one. The second car is a
+Mazda MX-5 NB2, ISO 9141-2, with an ELM327 v2.3: 383 ms round trip and ~2 req/s, against
+the MiTo's 50-67 ms and 12-14 req/s. What was measured is in
+`docs/COMPATIBILIDAD_MX5_NB2.md` and `docs/ANALISIS_LOGS.md`.
 
-- [x] **El hueco configurado no se aplicaba.** Con `gapcfg=8` el log media
-  `gap=41` ms: la cadencia de dibujo se comprobaba antes que la espera del
-  hueco y un frame (~33 ms) se comia el intervalo. Capacidad caida de ~12
-  a ~10 peticiones/s. Se da prioridad al hueco: se duerme 2 ms hasta que
-  vence y el dibujo se recupera en el siguiente VBlank.
-- [x] **Handshake con mascara 00000000.** Un ELM327 recien alimentado
-  respondia `0100` con mascara 0 y la app arrancaba con solo 12 PIDs en
-  vez de 17. Se anaden 2 reintentos de la mascara, con 250 ms de pausa,
-  antes de rendirse.
-- [ ] Seguir monitorizando: en `phase1_077` aparecieron 2459 `STOPPED` y
-  750 `SEARCHING` con 4 cortes de enlace. La escalada por atasco ya los
-  recupera, pero conviene confirmar que con el hueco arreglado bajan.
-
-## Fase 2.10 — Ventana de STOPPED y ancla del hueco (fase2.45)
-
-Datos: `phase1_079`/`phase1_080` (21-nov), `elm_gap=8`, build fase2.44.
-
-**Resultado bueno**: STOPPED baja de 2459 a 82/105, siempre 17 PIDs, y
-el RPM llega a **5,33 Hz** con 16,14 peticiones/s en el log mas limpio
-(`phase1_080`). El objetivo de 4,5 Hz esta cumplido.
-
-**Dos ajustes**:
-
-- [x] **Ancla del hueco**: `g_last_resp_ms` se marcaba incluso en una
-  respuesta STOPPED y no se reiniciaba al perder el enlace. Eso hacia que
-  el primer comando tras un corte "midiera" un hueco enorme. Ahora no se
-  ancla en STOPPED y se pone a 0 al cerrar el socket.
-- [x] **Contador de atasco en ventana deslizante**: con STOPPED
-  intercalados entre respuestas buenas, el contador consecutivo nunca
-  llegaba a 8. Ahora se cuenta en una ventana de 12 peticiones.
-
-Pendiente: ver si con esto desaparecen los dos cortes por atasco que
-aun quedaban en 079/080.
-
-## Fase 2.11 — Cajas de datos lentos atenuadas (fase2.46)
-
-Los datos que se piden poco (aceite y combustible cada 10 s, baro cada
-30 s) desaparecian de la rejilla: `sample_value()` descartaba cualquier
-muestra de mas de 6 s y las cajas invalidas se compactaban.
-
-- [x] **TTL por PID**: los PID con periodo base de 5 s o mas viven 3
-  periodos (30 s para aceite/combustible, 90 s para baro). Los rapidos
-  conservan el corte de 6 s para que un corte de enlace no dibuje una
-  linea plana larga en las graficas de telemetria.
-- [x] **Atenuacion en vez de ocultar**: las cajas con datos viejos se
-  dibujan al 55% de intensidad, legibles, en lugar de desaparecer. El
-  umbral de atenuacion es el doble del periodo (minimo 3 s) para que
-  las cajas rapidas no parpadeen entre claro y oscuro.
-- [x] Aplicado a las rejillas MOTOR y DIAG (STFT, LTFT, avance, O2, MIL,
-  voltaje, combustible) y a todas sus cajas.
-
-## Fase 2.12 — Reconexión sin perder datos y aviso global (fase2.47)
-
-- [x] **Reconexión sin borrar los valores**: al perder el enlace por un
-  atasco en STOPPED se conserva el socket para probar `ATZ` antes de
-  desconectar el WiFi. `g_store` y `g_boost` se guardan por valor y se
-  restauran si el `ATZ` funciona. Durante la reconexión el contenido
-  queda atenuado al 55%, legible, con `REINTENTANDO n/3` a brillo completo.
-- [x] **`ATZ` antes del WiFi**: si el ELM327 responde al reset, se rehace
-  el handshake sobre la misma conexión TCP y se evitan los 10-30 s del
-  ciclo WiFi. El log escribe `Recuperacion: ATZ OK` o `ATZ fallo -> WiFi`
-  para medirlo.
-- [x] **Aviso global en la cabecera**, visible en las siete pestañas:
-  ECT ≥ 105 °C (ámbar) / ≥ 115 °C (rojo), IAT ≥ 70 °C, voltaje < 11,5 V.
-  Parpadea con el VBlank y muestra `+1` si hay más de un aviso activo.
+- [x] **K0 - Vehicle probe (`SONDA DEL COCHE`).** Eighth tab, read-only. Reads adapter
+  and ECU identity, the masks with the list of declared PIDs, the raw header line, and
+  then requests every PID once to show which ones the car answers. Everything to the log.
+- [x] **K1 - Wait for the protocol search.** While the adapter says `SEARCHING` the app
+  now waits up to 20 s. It used to abort at 3 s, which left the ELM327 stuck in `STOPPED`
+  for the rest of the session (876 `STOPPED` and zero `NO DATA` in `phase1_001`).
+  `protocol.txt` additionally allows forcing the protocol (3 = ISO 9141-2, 5 = KWP fast
+  init, 6/7 = CAN).
+- [x] **K1b - A log that survives.** Written to the card every second, filesystem sync
+  every 2 s. Before, leaving the app without the menu left the log with the boot lines
+  only (235 bytes of an entire session).
+- [x] **K2 - Period split by measured capacity.** Done in `fase2.46`. The base table
+  is a demand for 12-14 req/s; when it does not fit 85% of the link's capacity the plan
+  compresses: RPM at 1 Hz, the next three values on the active screen sharing the rest,
+  everything else at one request a minute. The period subtracts the service time, because
+  the scheduler measures it from completion. The selector also changes while compressed:
+  priority first, then the oldest deadline - pure EDF was why RPM starved, as a
+  short-period PID is almost never overdue. Capacity is the protocol class, lowered on
+  K-line by what a 10 s window measures; CAN is never measured, so that car's behaviour
+  cannot depend on a measurement. Measured criterion, because the original wording was
+  arithmetically impossible: RPM at 1 Hz plus four values at 0.5 Hz is 3 req/s against
+  1.879 delivered and a 2.61 theoretical floor. The plan gives RPM >= 0.9 Hz with up to
+  three values at >= 0.15 Hz and stays under 85% utilisation.
+- [ ] **K3 - GENERAL panel without MAP.** On a naturally aspirated car with no `0B` and
+  no `33` the centre boost gauge is a permanent `N/D`. Replace it with MAF (g/s) and load
+  (%), and disable `TURBO AUTO` learning when there is no MAP. Criterion: the GENERAL
+  screen shows no permanently missing value.
+- [ ] **K4 - K-line module discovery.** Half done. The parser now understands the
+  three-byte header (`48 6B 10`) with a unit test built from the captured line, and the
+  mask comes back as `BE1FB811`. Still open: the MODULOS scan itself sends CAN/UDS
+  headers, so on K-line the screen stays greyed on purpose - the next step is a K-line
+  path that reads `0100` with headers on and nothing else.
+- [ ] **K5 - Link stability.** Two drops in five minutes in `phase1_003` (at 157 s and
+  233 s), the second one never recovered. Separate adapter, PSP WiFi and car, and decide
+  whether reconnecting needs more than the current three attempts.
 
 ## Fase 3 — Parámetros específicos Alfa Romeo (investigación)
 
@@ -320,6 +293,128 @@ Criterios de aceptación:
 - Empaquetado (`EBOOT.PBP`, icono, manual).
 - Pruebas de uso real: montaje, legibilidad con sol, guantes, acompañante.
 
+## Phase 5 - On-board diagnostics (FALLOS screen)
+
+Goal: have the app say why the check-engine lamp came on. Today it only shows live data
+and PID `21` (distance with MIL); it never reads codes.
+
+- [ ] Read PID `01` (MIL state and number of stored codes).
+- [ ] Mode `03`: stored codes, decoded to P0xxx with a local description table.
+- [ ] Mode `07`: pending codes. Mode `0A`: permanent codes.
+- [ ] Mode `02`: freeze frame for the first code (a snapshot of the data at the fault).
+- [ ] Mode `06`: on-board monitor results (pass/fail).
+- [ ] Read-only throughout. Mode `04` (clear) and mode `08` are never sent.
+
+Criterion: on a car with the lamp on, the screen shows the same code as a commercial
+reader, and with no codes it says so explicitly instead of showing an empty list.
+
+## Phase 6 - UI, preferences and vehicle profiles
+
+Goal: stop navigating eight tabs with two triggers, make SELECT carry its own job, keep
+the layout per car, and let the app work out which car it is in. Full design in
+`docs/superpowers/specs/2026-11-17-ui-screens-preferences-and-vehicle-profiles-design.md`.
+
+- [x] **U1 - Screen picker on SELECT.** Done in `fase2.44`. SELECT opens a full-screen
+  list of all screens with a one-line purpose each (eight when U1 landed, nine since FALLOS); UP/DOWN moves, X or START opens
+  it, SELECT or CIRCLE closes it. START keeps the settings menu. The current screen is
+  marked ACTUAL and the selection skips screens this car cannot use.
+- [x] **U2 - Two-tier bar.** Done in `fase2.44`. GENERAL, MOTOR, DIAG and TELEM are the
+  driving tier: the only screens L/R cycles and the only ones drawn in the bar. MODULOS,
+  SNIFFER, SONDA and INFO are the tools tier, reached through the picker, and the bar then
+  shows the screen name plus `HERRAMIENTAS  L/R: VOLVER`. MODULOS and SNIFFER are greyed
+  with a reason on a K-line car (`scan_can()` reads the ATDPN reply, no bus traffic), and
+  `last=` in `settings.txt` reopens the app on the last driving screen, written once per
+  change and on exit.
+- [x] **U3 - Preferences v2.** Done in `fase2.47`. `version=2`, `start=` (a screen name
+  or `last`), `hidden=`, and `v.<id>.<key>` blocks so each car keeps its own slot items,
+  styles, telemetry series and tacho. Edits are captured into the connected car when there
+  is one and into the global layout otherwise, so a view arranged in the MX-5 cannot leak
+  into the MiTo. `PANTALLA INICIAL` is in the settings menu instead of being file-only.
+- [x] **U4b - Centre gauge and layout from the profile.** Done in `fase2.47`. A car with
+  no MAP draws MAF in the centre slot and load beside it; a car with neither draws load;
+  the telemetry chart follows the same rule. The choice is an overlay that only applies
+  while the view is still the factory one, so a view the user arranged is never touched.
+  MARCHA is a derived widget fed by the profile's gear ratios (km/h per 1000 rpm) and it
+  says N/D when the numbers do not add up.
+- [ ] **U5 - New screens in both languages.** FALLOS and the new picker strings already go
+  through `tr()`; the SONDA labels and the older screens still carry Spanish literals.
+- [x] **U6 - Selectable boot animation.** Done in `fase2.47`. `ANIMACION` is a three-way
+  choice: none (straight to the dashboard), the MiTo cloverleaf, or a new MX-5 roadster in
+  `src/psp/splash_mx5.c` with pop-up lights opening and the word mark. Old settings keep
+  their meaning.
+
+Criterion: on the MX-5 the bar shows four driving screens, SNIFFER is not offered, the
+layout is the MX-5's own, the app opens on the preferred screen, and the log names the car
+and the masks it was recognised by. On the MiTo nothing changes except the bar.
+
+## Fase 7 - Primeras sesiones reales con el MX-5
+
+Objetivo: que el cuadro sirva en el coche. Tres sesiones con el motor en marcha
+(`phase1_006`, `007`, `008` y `009`, 609 s en total) destaparon nueve defectos que ningun
+test ni emulador habria encontrado, porque todos dependen de como se porta el
+enlace real. Todo cerrado entre `fase2.49` y `fase2.56`, cada uno con la linea
+del log que lo demuestra.
+
+- [x] **P1 - Identificar el coche despues de fijar el protocolo.** `fase2.49`.
+  La deteccion corria mientras el adaptador aun contestaba `ATDPN A0`, y sin
+  clase de protocolo ningun perfil casa: la MX-5 salia como generica (tacometro
+  7000, sin zona roja, sin relaciones de cambio). Ahora el protocolo se relee
+  antes de repartir la tabla, y no se afirma identidad sin el.
+- [x] **P2 - Recuperacion de una centralita en silencio.** `fase2.49`. Veinte
+  `NO DATA` seguidos escalan a la reconexion: antes solo se consideraba caido un
+  enlace sin bytes, y una ECU muda deja la pantalla congelada para siempre.
+- [x] **P3 - Timeout de peticion segun el bus.** `fase2.49`. 1000 ms en K-line
+  (la vuelta medida son 383 ms y el clon pasa de 500), 500 en CAN. Quita los
+  `STOPPED` por prompt tardio: 8 por sesion antes, 0 despues.
+- [x] **P4 - Modo 02 solo si la ECU lo anuncia.** `fase2.49`. La MX-5 no lo da
+  (`0100` bit 02 a cero): la fila del congelado dice ahora `SIN MODO 02` en vez
+  de quedarse muda, y no se gastan cinco peticiones en preguntar.
+- [x] **P5 - Umbrales de frescura escalados al enlace.** `fase2.50`. Con 1000 ms
+  fijos, el indicador parpadeaba entre naranja y verde una vez por segundo y el
+  panel se atenuaba al 55 %. Ahora se escala con el hueco medido entre muestras.
+- [x] **P6 - Salida limpia.** `fase2.51` y `fase2.52`. Mantener `START` 1,2 s
+  sale desde cualquier pantalla, tambien desde las que tienen bucle propio; la
+  fila `SALIR` existia pero se dibujaba fuera del panel (x=472 de 480) y era
+  invisible. Las dos salidas escriben el resumen de sesion.
+- [x] **P7 - Una muestra vale tres ciclos de su PID.** `fase2.53`. Con 6 s fijos,
+  el refrigerante salia `N/D` en 45 de 127 muestras, la velocidad en 53 y el aire
+  en 57. Ahora 0, 0 y 11.
+- [x] **P8 - El plan deja de comerse a si mismo.** `fase2.53` y el umbral del 70 %
+  en `585b75b`. El estimador comparaba lo entregado con lo que pedia la tabla
+  (siempre mas que el presupuesto) y recortaba en cada ventana: 2,40 -> 0,80 req/s
+  en menos de dos minutos. Con el umbral en el 70 % deja de caer y vuelve a subir;
+  `phase1_009` lo confirma: dos lineas de `Enlace` en toda la sesion, las dos en el
+  techo.
+- [x] **P9 - Interpolacion de presentacion.** `585b75b` y rehecha en `fase2.56`.
+  Entre dos muestras el valor pintado recorre el escalon entero en linea recta
+  durante el intervalo de muestreo de ese PID (150 ms - 4 s). La primera version
+  usaba un filtro exponencial con tau = periodo/3 y no servia: cubria el 95 % en el
+  primer tercio y se quedaba parada el resto, que es lo que se veia como "no es
+  progresivo". Sustituida por la prediccion de `fase2.61` y, al verla en el coche,
+  por el ease de P11. El log de estado lee la medida cruda.
+- [x] **P10 - Caducidad por cadencia real.** `fase2.56`. Una muestra vale tres veces
+  el intervalo **real** de su PID (media movil del hueco medido), no el que promete
+  el plan, con suelo de 6 s y techo de 30. Cierra los ultimos `N/D` intermitentes.
+- [x] **P11 - La aguja se mueve, no adivina.** `fase2.63`. La prediccion que salio
+  en `fase2.61`/`fase2.62` se va: en el coche adelantaba peor que la rampa. (El
+  avance que mostraba valores imposibles no lo causaba la prediccion: 0x0E nunca
+  paso por ella, y el log de esa sesion no esta; queda como T18.) En su lugar las agujas del tacometro y del velocimetro
+  se acercan a la ultima medida en cada fotograma, con `tau` elegible (`AGUJA`:
+  directa / 150 ms / 400 ms), y nunca extrapolan; los numeros, las barras y la grafica
+  siguen siendo la medida tal cual. El almacen deja de filtrar al guardar, asi que el
+  log, los maximos y la grafica son evidencia.
+  `REPARTO` (0-4) decide cuantos valores de pantalla entran en el reparto rapido del
+  enlace; el cupo se reparte por importancia (velocidad, carga, avance, mariposa,
+  temperaturas), solo cuenta lo que se pinta, y el reparto pide el presupuesto exacto
+  (un test lo fija). El techo de la clase K-line sube a 2,5 req/s, que es lo que la
+  MX-5 ya entrego en `phase1_010`. Con el presupuesto de la MX-5 y cinco valores
+  pintados el plan pide una muestra de RPM cada 615-816 ms segun `REPARTO`; la cifra
+  medida queda pendiente de T17.
+
+Criterio: el coche se identifica solo, una sesion completa sin `NO DATA`, los
+indicadores se mueven y no parpadean a `N/D`, y salir deja el resumen en el log.
+Pendiente de comprobar en marcha: el indicador de marcha y los valores bajo carga.
+
 ## Fuera de alcance
 
 - Escritura/codificación en la ECU.
@@ -330,23 +425,33 @@ Criterios de aceptación:
 
 ## Riesgos principales
 
-| Riesgo | Impacto | Mitigación |
+| Risk | Impact | Mitigation |
 |---|---|---|
-| PSP sin WPA2 nativo | Alto | Adaptador abierto/WEP/WPA-TKIP, plugin ARK4 o puente |
-| Adaptador sin DHCP | Medio | IP estática configurable |
-| PID no disponibles | Alto | Máscaras + `N/D`, perfil por sesión |
-| ELM327 clon lento/inestable | Medio | Timeouts, backoff, diagnóstico |
-| Ancho de banda bajo | Medio | Scheduler por prioridad, no pedir todo |
-| Memoria/CPU PSP | Medio | Buffers fijos, 30 fps, atlas de fuente |
-| Memory Stick lenta/extraída | Bajo | Flush periódico, cierre seguro |
-| Interpretar boost/Torque mal | Alto | MAP/baro explícitos, `EST`, no inventar |
-| Fatiga/seguridad al conducir | Alto | Montaje, acompañante, solo lectura |
+| PSP without native WPA2 | High | Open/WEP/WPA-TKIP adapter, ARK4 plugin, or a bridge |
+| Adapter without DHCP | Medium | Configurable static IP |
+| PIDs not available | High | Masks + `N/D`, per-session profile |
+| Slow or unstable ELM327 clone | Medium | Timeouts, backoff, diagnostics |
+| Low bandwidth | Medium | Priority scheduler, never poll everything |
+| PSP memory/CPU | Medium | Fixed buffers, 30 fps, font atlas |
+| Slow or removed Memory Stick | Low | Periodic flush, clean close |
+| Misreading boost/Torque | High | Explicit MAP/baro, `EST`, never invent |
+| Fatigue/safety while driving | High | Mounting, passenger, read-only |
+| K-line link of ~2 req/s | High | Capacity-based split (K2), few PIDs on screen |
+| Three-byte headers on K-line | Medium | Per-protocol discovery parser (K4) |
+| ELM327 v2.3 clone at 383 ms | Medium | Document the ceiling; recommend a better adapter |
 
 ## Decisiones pendientes
 
-1. Modo de seguridad real del ELM327 y modelo/CFW de PSP.
-2. Toolchain: Docker `pspdev` o instalación nativa.
-3. Confirmar si el coche expone `0x0B` (MAP), `0x33` (baro), `0x5C` (aceite)
-   y `0x5E` (caudal).
-4. Confirmar el redline real y los umbrales que quiere el usuario.
-5. Confirmar si se usará el plugin WPA2 de ARK4 o un puente.
+1. Real ELM327 security mode and exact PSP model/CFW.
+2. Toolchain: Docker `pspdev` or a native install.
+3. Confirm whether the car exposes `0x0B` (MAP), `0x33` (baro), `0x5C` (oil) and
+   `0x5E` (fuel rate). **Answered for the MX-5 in `COMPATIBILIDAD_MX5_NB2.md`: none of
+   them exists.**
+4. Confirm the real redline and the thresholds the owner wants.
+5. Whether the ARK4 WPA2 plugin will be used or a bridge.
+6. K2: fixed periods per protocol class, or measured live from `rtt`.
+7. FALLOS: its own tab, or inside DIAG.
+8. MODULOS and SNIFFER on a K-line car: hide them, warn, or adapt them.
+9. GENERAL panel: adapt automatically to the car (no MAP means MAF/load), or make the
+   layout a selectable profile.
+10. Whether K-line support is generic (any car) or MX-5 only.

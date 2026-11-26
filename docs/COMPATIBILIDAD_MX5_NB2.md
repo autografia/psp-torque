@@ -1,0 +1,300 @@
+# OBD-II compatibility — Mazda MX-5 NB2
+
+The second reference car, after the Alfa Romeo MiTo QV 2010. The MiTo is CAN 11-bit
+and is the car everything was calibrated on; the MX-5 is **K-line ISO 9141-2**, which
+is a different world in both timing and available PIDs. This document records what was
+measured, not what was expected.
+
+## 1. Vehicle and link
+
+| Component | Detail |
+|---|---|
+| Car | Mazda MX-5 NB2 (second generation, 2001–2005), naturally aspirated petrol |
+| Console | PSP-2000/3000 with ARK4 custom firmware |
+| Adapter | ELM327 **v2.3** over WiFi (clone), open network `V-LINK` |
+| Address | `192.168.0.10:35000` (the app's factory default) |
+| Supply | `ATRV` 13.6–13.8 V with the ignition on |
+
+Still to be filled in by the owner: exact model, engine and VIN of the specific car.
+Nothing is invented in its place.
+
+## 2. Protocol
+
+Measured, not assumed:
+
+```
+ATDPN  -> A3            (3 = ISO 9141-2)
+ATDP   -> AUTO, ISO 9141-2
+```
+
+And the real header of the reply to `0100`, captured with `ATH1` + `ATS1`:
+
+```
+48 6B 10 41 00 BE 1F B8 11 AA
+```
+
+That line is the evidence behind the K-line module-discovery bug: the header is **three
+bytes** (`48 6B 10`), not a CAN id of 3 or 8 hex digits, and `obd_disc_parse_line` does
+not recognise it. See ROADMAP, phase K4.
+
+### 2.1 Link timings
+
+| Quantity | MiTo (CAN) | MX-5 (ISO 9141-2) |
+|---|---|---|
+| Round trip for one PID | 50–67 ms | **383 ms** (500–516 ms after a drop) |
+| Protocol search (`0100` after `ATSP0`) | negligible | **4315 ms** |
+| Requests per second, measured | 12–14 | **1.9** |
+| Requests per second, ceiling | ~18 | **~2.6** (1/0.383) |
+
+The protocol search is the reason the app did not work on this car: the 3-second
+timeout aborted it 1.3 seconds before the adapter answered, which left the ELM327
+stuck in `STOPPED` for the rest of the session (876 `STOPPED` replies on the first
+attempt). Fixed in phase K1.
+
+## 3. PIDs
+
+Masks declared by the ECU:
+
+```
+0100 -> BE 1F B8 11
+0120 -> 80 00 00 00
+0140 -> not supported
+```
+
+Declared PIDs: `01 03 04 05 06 07 0C 0D 0E 0F 10 11 13 14 15 1C 20 21`.
+
+Result of the `SONDA DEL COCHE` probe (18 PIDs, requested one at a time): **13 answer,
+5 do not exist**. Values from session `phase1_003` at idle:
+
+| PID | Value | State | Measured |
+|---|---|---|---|
+| 0C | RPM | yes | 801–820 |
+| 0D | vehicle speed | yes | 0 |
+| 05 | coolant | yes | 82–86 °C |
+| 0F | intake air | yes | 53 °C |
+| 10 | MAF | yes | 2.20–2.28 g/s |
+| 11 | throttle | yes | 0 % |
+| 04 | engine load | yes | 18 % |
+| 06 | STFT | yes | +0.00 % |
+| 07 | LTFT | yes | +3.13 % |
+| 0E | timing advance | yes | +7.5° |
+| 14 | O2 bank 1 sensor 1 | yes | 0.11 V |
+| 15 | O2 bank 1 sensor 2 | yes | 0.11 V |
+| 21 | distance with MIL | yes | 0 km |
+| 0B | MAP | **no** | — |
+| 33 | barometric pressure | **no** | — |
+| 42 | module voltage | **no** | — |
+| 5C | oil temperature | **no** | — |
+| 2F | fuel level | **no** | — |
+
+Also: `09` (vehicle information) **is not declared**, so VIN, CalID, CVN and ECU name
+cannot be read through mode 09 on this car. The probe returning them empty is correct
+behaviour, not a fault.
+
+Watch item: 53 °C intake air at idle is high (heat soak in the engine bay). Worth
+confirming it falls while driving before treating it as a bad reading.
+
+## 3b. Vehicle profile
+
+Since `fase2.45` the app recognises the car on connect and applies its numbers, so the
+MX-5 no longer inherits the MiTo's tacho. The evidence is what the app already reads:
+`ATDPN` plus the three masks. The session log carries exactly one line:
+
+```
+Vehiculo: Mazda MX-5 NB2 (detectado, proto A3, mascaras BE1FB811/80000000/--------) tacometro=8000 rojo=7000 corte=7200
+```
+
+| Profile key | MX-5 NB2 | Where it comes from |
+|---|---|---|
+| gauge scale | 8000 rpm | the needle keeps climbing past 7000; the useful band ends around 7500 |
+| red zone | 7000 rpm | owner's decision, and it matches the car's own tacho |
+| fuel cut | 7200 rpm | owner's decision; used for the "about to cut" warning |
+| centre gauge | MAF | no `0B`, no `33`: boost cannot exist here, MAF can |
+
+Detection is a mask match on `BE1FB811` with the protocol in the K-line class, so it does
+not depend on the probe being run. `profile=MAZDA_MX5_NB2` in `settings.txt` forces it,
+and the log then says `forzado`. On any car without a matching profile nothing changes:
+the tacho and red zone stay as the person set them.
+
+The centre gauge switch is wired since `fase2.46` (`g_vehicle_centre` chooses between
+BOOST, MAF and load, and the GENERAL panel draws whichever it gets), so this car shows
+MAF in the middle with or without a profile.
+
+Until `fase2.49` the detection did not work on this car: it ran while the adapter still
+answered `ATDPN` with `A0`, and with no protocol class no profile can match, so the log
+said `Vehiculo: Generic K-line (generico, proto A0, ...) tacometro=7000 rojo=0 corte=0`
+while the very next line already said `ATDPN (conexion): A3`. The protocol is now
+reread before the scheduler is built, and detection refuses to latch while it is
+unknown. `tests/test_vehicle.c` pins both sides of that border.
+
+## 3c. What the 18/11/2026 session showed
+
+`phase1_006.log`, 198 s, engine idling and warming up, car stationary, `fase2.48`:
+
+```
+Vehiculo: Generic K-line (generico, proto A0, mascaras BE1FB811/80000000/00000000)
+ATDPN (conexion): A3
+Enlace: 2.30 req/s entregadas, pedidas 2.44; plan 2.20 req/s (comprimido)
+t=154 rpm=2137 map=N/D boost=N/D ect=67 iat=27 spd=0 rtt=384 gap=167 gapcfg=8 ok=360 nd=0 to=14 fps=30 cpu=2 wait=13 int=33 vb=2 v=6648
+```
+
+| Reading | Value over the session |
+|---|---|
+| rpm | 1002 → 820 idle once warm, blips to 1433 and 2137 |
+| coolant | 40 → 67 °C (warming from cold, never reached thermostat) |
+| intake air | 23–27 °C |
+| MAF | 2.4–3.5 g/s at idle, 8.9 on the blip |
+| engine load | 9–27 % |
+| timing advance | 9.5–22.5° (J1979: byte/2 − 64) |
+| throttle | 0 % (the car has `11` but not `49`/`4A`, so this is the plate, not the pedal) |
+
+Four things came out of it:
+
+1. **The profile bug above.** The car answered `4100BE1FB811` exactly as expected and
+   still came out generic. Fixed in `fase2.49`.
+2. **A silent ECU left the screen frozen.** The last 42 s of the log (from `t=155` to
+   `t=198`) are 55 consecutive
+   `NO DATA` replies while the adapter itself answered every command: the engine was
+   switched off and the app kept showing the last good rpm. A NO DATA reply carries
+   bytes, so the dead-link counter never fired. Twenty in a row now escalate to the
+   reconnect path. If the ignition comes back the app reconnects on its own; if it
+   does not, the retries stop after three and `TRIANGLE` reconnects by hand.
+3. **No freeze frame on this car.** `0100` bit `02` is clear, so mode 02 does not
+   exist: `FALLOS` can list stored, pending and permanent codes but can never show the
+   frame that was running when the fault set. The screen now says `SIN MODO 02` rather
+   than leaving the row empty, and the app no longer spends five requests asking.
+
+4. **The link indicator flickered orange/green once a second.** The freshness
+   thresholds were fixed at 1000 ms for "old data" and 3000 ms for "no data", which
+   is right for CAN, where a PID comes back every 330 ms. Here each request takes
+   383 ms and the plan spreads fifteen PIDs over a 2.3 req/s bus, so a value is
+   refreshed every 1–2 s: every one of those gaps crossed 1000 ms, which dimmed the
+   whole panel to 55 % and put the header on `DATOS VIEJOS`. The thresholds now
+   scale with the measured gap between accepted samples (five gaps for old, fifteen
+   for dead, floored at the old 1000/3000 ms so a fast car behaves exactly as
+   before).
+
+Not yet exercised on this car: the `FALLOS` screen itself (mode 03/07/0A), the gear
+indicator (needs the profile, so it read `N/D` all session), and any driving data.
+
+## 3d. Second session, `phase1_007` (fase2.52)
+
+255 s parked, idling, a short blip to 3200 rpm at the end, then a clean exit.
+
+```
+build: fase2.52
+Vehiculo: Mazda MX-5 NB2 tacometro=8000 rojo=7000 corte=7200
+Fin de sesion: peticiones=425 datos=425 nd=0 to=0
+Enlace: 1.77 req/s medidas, plan 1.50 req/s (comprimido)
+Sesion: 255 s, reconexiones=0, caidas=0
+```
+
+Three things settled and two found:
+
+- **The profile works.** It is the car, not a generic K-line, so the tacho ends at
+  8000, the red zone is at 7000 and the gear ratios are loaded — unproven, since no
+  session so far has moved (the gear needs speed above zero).
+- **The link is clean.** 425 requests, 425 answers, zero `NO DATA`, zero timeouts,
+  zero reconnects: the 1000 ms K-line timeout removed the late-prompt desyncs that
+  used to cost a request each.
+- **The clean exit writes the summary**, which is how we now know how a session went
+  without reading 36 KB of protocol traffic.
+- **The plan collapses by itself** (`2.40` delivered at `t=12`, plan `0.80` at `t=112`,
+  under two minutes, on a link that carries 2.30). The capacity estimator compared the delivered
+  rate against what the *table* wanted rather than against what the *plan* chose to
+  spend, and with the plan compressed the table always asks for more, so it cut every
+  window and never came back. `fase2.53` compares against the budget.
+- **Every value but rpm blinked to `N/D`** for a third of the time (coolant 45 of 127
+  samples, intake 57, speed 53). A sample was trusted for a flat 6 s while the plan
+  refreshes each one every 6–9 s. A sample now lasts three of its own cycles, floor
+  6 s, cap 30 s.
+
+## 3e. Third session, `phase1_008` (fase2.54)
+
+156 s parked and idling, clean exit, no drive.
+
+```
+Fin de sesion: peticiones=290 datos=290 nd=0 to=0
+Vehiculo: Mazda MX-5 NB2 tacometro=8000 rojo=7000 corte=7200
+Enlace: 1.54 req/s medidas, plan 1.31 req/s (comprimido)
+```
+
+| Reading | Before (`007`, fase2.52) | After (`008`, fase2.54) |
+|---|---|---|
+| coolant N/D | 45 of 127 samples | **0 of 77** |
+| speed N/D | 53 of 127 | **0 of 77** |
+| intake N/D | 57 of 127 | 11 of 77 |
+| coolant refresh | every 7.5 s | every 4.2 s |
+| speed refresh | every 8.8 s | every 4.4 s |
+| rpm refresh | every 1.12 s | every 1.06 s |
+
+Three fixes are visible in that table: a sample now stays valid for three of its own
+cycles instead of a flat 6 s, the capacity estimator no longer ratchets the plan down,
+and with more of the budget reaching the slower PIDs, coolant and speed refresh almost
+twice as often. Intake air did not improve (9.4 s to 9.8 s) and is the one still
+blanking occasionally.
+
+One knob was left open at the time: the estimator sawtoothed (2.20 -> 1.40 -> 1.54 ->
+1.69 -> 1.86 -> 2.05 -> 2.20), because the cut threshold was 0.85 of the request and the
+plan asks for exactly 85 % of capacity, so a healthy link sat on the line. The threshold
+is 0.70 since `585b75b` and `phase1_009.log` confirms it: 175 s, 335 requests, 335
+answers, two `Enlace` lines in the whole session instead of nine, both at the ceiling
+(`2.40` delivered against a `1.87` plan, then `2.20`).
+
+A sample is now trusted for three of its **own real** intervals rather than the period
+the plan promised, capped at 30 s, which is what removed the last of the blanking.
+
+## 4. Design consequences
+
+1. **`BOOST` cannot exist on this car.** `BOOST = MAP − barometric` and neither `0B`
+   nor `33` exists. The centre of the GENERAL screen is condemned to `N/D`. What the
+   car does have is MAF (g/s) and load (%), which is where the centre of that panel
+   should go on a naturally aspirated engine.
+2. **The voltmeter is dead too.** Without `42` there is no battery voltage over OBD;
+   the only voltage available is the adapter's own (`ATRV`), which is not the car's.
+3. **The period table does not apply.** It is calibrated for 12–14 req/s against a
+   link that delivers 1.9: the scheduler is oversubscribed about 7×, so every PID
+   refreshes far later than requested. Measured: RPM every 4.4 s (36 requests in
+   157 s) instead of every 200 ms.
+4. **Polling must be few and fast.** With a 2.6 req/s ceiling, four live values means
+   one refresh each per 1.5 s. Everything else (trims, O2 sensors, advance) is noise
+   while driving.
+5. **The MODULOS and SNIFFER screens cannot work here as written.** The UDS scan is
+   CAN-only and the header parser does not understand `48 6B 10`.
+
+## 5. Link drops
+
+`phase1_003` dropped the link twice, at `t=157` and `t=233`. On the first, `rtt` rose
+from 383 to 500 ms, nine timeouts accumulated, and the automatic reconnect recovered on
+the first attempt. On the second, all three attempts failed and the session stayed
+`offline` to the end.
+
+That question is now closed. The 55 `NO DATA` replies at the end of `phase1_006` looked
+like a third drop, but `phase1_008` ran 156 s and `phase1_007` 255 s with **zero**
+`NO DATA`, zero timeouts, zero reconnects and zero drops, and in both the owner switched
+the engine off *after* the app had exited cleanly. The link does not fail on its own; the
+silence in `006` was the ignition going off while the app kept polling. The 500 ms
+request timeout was a real defect (it caused the late-prompt desyncs that cost a request
+each time), and it is 1000 ms on K-line since `fase2.49`.
+
+Two mechanisms now cover the genuine failure modes: twenty consecutive `NO DATA` escalate
+to a reconnect (`fase2.49`), and the adapter stuck on `STOPPED` still escalates after
+eight replies (`fase2.42`).
+
+## 6. How to repeat the probe
+
+1. Copy `EBOOT.PBP` to `ms0:/PSP/GAME/HOMEBREW/psp-torque/` (or wherever the app lives).
+2. Adapter on, ignition on, engine off or idling.
+3. Launch the app and wait for it to connect. The first connection can take up to
+   20 s: it is waiting for the adapter to find the protocol.
+4. Press `L` until the `SONDA` tab, then `X`. It takes 30–60 s.
+5. Exit with `START > SALIR > X` and read
+   `ms0:/PSP/SAVEDATA/PSPTORQUE/phase1_*.log`.
+
+## 7. Adapter limits
+
+- The ELM327 v2.3 is a clone. Its 383 ms round trip is more than triple what a genuine
+  ELM327 does on K-line (100–150 ms typical). A better adapter would raise the 2.6
+  req/s ceiling and ease the cadence problem, but not remove it.
+- Mode 01 does not allow more than one PID per request. There is no shortcut.
+- The car only speaks ISO 9141-2: there is no CAN bus to listen to.

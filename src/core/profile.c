@@ -209,3 +209,171 @@ const obd_poll_def PROFILE_ENGINE_POLL[] = {
 
 const int PROFILE_ENGINE_POLL_COUNT =
     (int)(sizeof(PROFILE_ENGINE_POLL) / sizeof(PROFILE_ENGINE_POLL[0]));
+
+/* ------------------------------------------------------------------ */
+/* FASE K2: reparto por capacidad del enlace.                         */
+/* ------------------------------------------------------------------ */
+
+float obd_profile_link_class(int proto_class)
+{
+    /* vehicle.h: OBD_PROTO_CAN == 0, ISO 9141-2 == 3, KWP == 5. Todo lo
+     * que no sea CAN se planifica como K-line. */
+    return (proto_class == 0) ? PROFILE_LINK_CLASS_CAN
+                              : PROFILE_LINK_CLASS_KLINE;
+}
+
+float obd_capacity_next(float current, float rate, float demand, float ceiling)
+{
+    if (rate <= 0.0f || demand <= 0.0f) {
+        return current;
+    }
+
+    /* El enlace no sostuvo lo pedido: la capacidad es lo entregado. Solo
+     * recorta, nunca sube, para que un pico no dispare el plan.
+     *
+     * El umbral es 0,70 y no 0,85 porque el plan ya pide solo el 85% de la
+     * capacidad (PROFILE_LINK_UTILIZATION), asi que un enlace sano entrega
+     * ~0,85 de lo pedido: con el liston en 0,85 cada ventana recortaba y el
+     * plan oscilaba entre 2,20 y 1,40 req/s en la MX-5 (phase1_008.log). */
+    if (rate < demand * 0.70f) {
+        float next = (rate < current) ? rate : current;
+        if (next > ceiling) {
+            next = ceiling;
+        }
+        if (next < PROFILE_LINK_RATE_FLOOR) {
+            next = PROFILE_LINK_RATE_FLOOR;
+        }
+        return next;
+    }
+
+    /* Sostuvo lo pedido con holgura: se puede aspirar a mas. Sube un 10%
+     * por ventana, con tope en el techo de la clase. */
+    if (rate > demand * 0.97f) {
+        float next = current * 1.10f;
+        if (next > ceiling) {
+            next = ceiling;
+        }
+        return next;
+    }
+
+    /* Zona muerta: ni sube ni baja. */
+    return current;
+}
+
+void obd_plan_init(obd_link_plan *plan, float capacity, uint16_t service_ms,
+                   float demand, int max_values)
+{
+    if (plan == NULL) {
+        return;
+    }
+    if (capacity < PROFILE_LINK_RATE_FLOOR) {
+        capacity = PROFILE_LINK_RATE_FLOOR;
+    }
+    plan->capacity = capacity;
+    plan->service_ms = service_ms;
+    plan->budget = capacity * PROFILE_LINK_UTILIZATION;
+    plan->compressed = (demand > plan->budget) ? 1 : 0;
+    if (max_values < 0) {
+        max_values = 0;
+    }
+    if (max_values > 8) {
+        max_values = 8;
+    }
+    plan->max_values = max_values;
+}
+
+uint16_t obd_plan_period(const obd_link_plan *plan, uint8_t pid, int visible,
+                         int rank, int value_count)
+{
+    uint16_t base = obd_profile_base_period(pid);
+    if (base == 0) {
+        return 0;
+    }
+
+    /* Sin compresion el plan ES la tabla base. Es lo que deja al MiTo y a
+     * cualquier enlace con capacidad de sobra exactamente como estaban. */
+    if (plan == NULL || !plan->compressed) {
+        return obd_profile_period(pid, visible);
+    }
+
+    float service = (float)plan->service_ms;
+    float rate;
+
+    /* Cuantos valores de pantalla entran en el cupo de REPARTO y cuantos
+     * se quedan fuera pero siguen visibles. Cada uno reserva su suelo (0,2
+     * Hz dentro del cupo, 0,1 fuera) y el RPM se lleva el resto: es lo
+     * unico que se nota cuando va lento, asi que con pocos valores en
+     * pantalla se le puede dar casi todo el enlace. */
+    int n = value_count;
+    if (n > plan->max_values) {
+        n = plan->max_values;
+    }
+    if (n < 0) {
+        n = 0;
+    }
+    int rest = value_count - n;
+    if (rest < 0) {
+        rest = 0;
+    }
+    float reserve = (float)n * PROFILE_PLAN_VALUE_HZ +
+                    (float)rest * PROFILE_PLAN_VALUE_SLOW_HZ;
+    float rpm_rate = plan->budget - reserve;
+    if (rpm_rate < PROFILE_PLAN_RPM_MIN_HZ) {
+        /* No cabe el reparto: el RPM se queda su minimo y los valores lo
+         * que sobre. El suelo manda sobre el presupuesto, porque el
+         * planificador sirve al RPM primero y es lo unico que se nota si
+         * se queda lento. */
+        rpm_rate = PROFILE_PLAN_RPM_MIN_HZ;
+        if (rpm_rate > plan->budget) {
+            rpm_rate = plan->budget;
+        }
+    }
+    if (rpm_rate > PROFILE_PLAN_RPM_MAX_HZ) {
+        rpm_rate = PROFILE_PLAN_RPM_MAX_HZ;
+    }
+
+    if (pid == 0x0C) {
+        rate = rpm_rate;
+    } else if (visible && rank >= 1 && value_count >= 1 && reserve > 0.0f) {
+        /* Lo que queda del presupuesto, repartido en proporcion a lo que
+         * pide cada valor: el cupo 0,2 Hz, el resto 0,1 Hz. La suma de
+         * todos los periodos con el RPM es el presupuesto exacto, de modo
+         * que el plan nunca pide al enlace mas de lo que tiene. */
+        float left = plan->budget - rpm_rate;
+        float want;
+        if (left <= 0.0f) {
+            left = 0.0f;
+        }
+        if (rank <= plan->max_values) {
+            want = PROFILE_PLAN_VALUE_HZ;
+        } else {
+            want = PROFILE_PLAN_VALUE_SLOW_HZ;
+        }
+        rate = left * want / reserve;
+    } else {
+        /* Fuera de pantalla: una peticion por minuto, que es lo que
+         * aguanta el enlace. */
+        return PROFILE_PLAN_BG_PERIOD_MS;
+    }
+
+    if (rate <= 0.0f) {
+        /* Un valor visible sin presupuesto no puede caer al fondo: aun asi
+         * se pide de vez en cuando para que el cuadro siga leyendose. */
+        return visible ? PROFILE_PLAN_VALUE_SLOW_MS : PROFILE_PLAN_BG_PERIOD_MS;
+    }
+
+    /* El planificador cuenta el periodo desde el fin de la respuesta
+     * (obd_sched_end), asi que el tiempo de servicio se cuenta dos veces
+     * si no se resta: 1 Hz con 532 ms de servicio no es 1000 ms. */
+    float period = 1000.0f / rate - service;
+    if (period < 100.0f) {
+        period = 100.0f;
+    }
+    if (period > (float)PROFILE_PLAN_BG_PERIOD_MS) {
+        period = (float)PROFILE_PLAN_BG_PERIOD_MS;
+    }
+    if (period < (float)base) {
+        period = (float)base;
+    }
+    return (uint16_t)(period + 0.5f);
+}

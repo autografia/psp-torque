@@ -210,3 +210,67 @@ con la formula OBD estandar.
 - **Nivel combustible 0x2F**: pendiente. Responde 0 % en algunas fases
   (tambien con el motor en marcha); conviene tratarlo como N/D si llega 0
   de forma aislada.
+
+## Mazda MX-5 NB2 (2003) - phase1_001 to phase1_003 (17 Nov 2026)
+
+The app's first session in a K-line car (ISO 9141-2), with an ELM327 v2.3. The three
+sessions tell the story of three failures.
+
+### phase1_001: nothing works, and the fault is ours
+
+- The network was perfect: `IP PSP 192.168.0.150`, SSID `V-LINK` open, gateway
+  `192.168.0.10`, TCP OK, `ATRV` 13.6 V. The adapter answered everything in ~30 ms.
+- `ATDPN` was `A0` on all six re-reads: the adapter never identified the protocol.
+- 303 `SEARCHING...` lines, every one cut at 3003 ms (handshake) or 2000 ms (probe),
+  which are exactly the app's timeouts.
+- **876 `STOPPED` replies** and **zero `NO DATA`**. The absence of `NO DATA` is the key:
+  `NO DATA` means "I spoke to the ECU and that PID does not exist"; zero of them means
+  the adapter never reached the ECU at all.
+- Probe: 0/18 PIDs, masks at zero, no VIN.
+
+Diagnosis: the ELM327 needs about 4 s to find a K-line car's protocol. The app aborted
+at 3 s, sent the next command mid-search, and the adapter answered `STOPPED` and stayed
+wedged there for the rest of the session. Fixed in phase K1 (see ROADMAP).
+
+### phase1_002: the log is lost on exit
+
+235 bytes: the boot lines only. The 4 KB log buffer was only flushed when it filled or
+at a handful of events, so leaving the app without going through the menu left the whole
+session in RAM. Fixed in phase K1b: the log is written to the card every second.
+
+### phase1_003: it works
+
+| Quantity | Value |
+|---|---|
+| Duration | 317 s (157 s connected, then two drops) |
+| Protocol | `A3` = ISO 9141-2 (`ATDP`: AUTO, ISO 9141-2) |
+| Reply to `0100` after `ATSP0` | `4100BE1FB811` at **4315 ms** |
+| Masks | `0100`=BE1FB811, `0120`=80000000, `0140` not supported |
+| Active PIDs | 15 |
+| Requests | 295 in 157 s = **1.9 req/s** |
+| Round trip | **383-384 ms** |
+| RPM cadence | **4.4 s** (36 requests in 157 s) |
+| FPS / CPU | 30-60 fps, 2-5 ms per frame |
+| Probe | 13/18 PIDs answer |
+
+Idle values: 804-820 rpm, ECT 82-86 C, IAT 53 C, MAF 2.20-2.28 g/s, load 18 %,
+throttle 0 %, LTFT +3.13 %, advance +7.5 degrees, O2 0.11 V, MIL off. No MAP, no baro,
+no module voltage, no oil temperature, no fuel level.
+
+Requests per PID up to t=157: RPM 36, MAF 31, throttle 30, speed 29, load 28, coolant
+23, intake 21, LTFT 14, STFT 14, O2-2 13, O2-1 13, advance 13, MIL 12.
+
+Consequence: the scheduler is oversubscribed about 7x. The algorithm is not wrong, the
+base periods are calibrated for a CAN link of 12-14 req/s. Fixed in phase K2.
+
+### Link drops
+
+`t=157`: rtt 383 -> 500 ms, 9 timeouts, the automatic reconnect recovered on the first
+attempt. `t=233`: rtt 516 ms, 21 timeouts, all three attempts failed and the rest of the
+session stayed `offline`. Still to investigate (T4 in PRUEBAS_PENDIENTES.md).
+
+### What the probe produced
+
+- Raw K-line header: `48 6B 10 41 00 BE 1F B8 11 AA`. The first three bytes are the
+  ISO 9141-2 header, and that is exactly what the discovery parser fails to recognise.
+- Mode 09 empty, and correctly so: PID `09` is not declared in the mask.
